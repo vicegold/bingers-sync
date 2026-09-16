@@ -653,7 +653,7 @@ Probed against the live account:
 | `library/metadata/{key}?includeGuids=1` | **verified** — returns `Guid: [imdb://…, tmdb://…, tvdb://…]` |
 | `library/sections/watchlist/all` | **verified** — pages via `X-Plex-Container-Start` / `-Size` **headers** (100/page; 500 → 400). `limit=` query param is ignored. `MediaContainer.totalSize` gives the true count |
 | `removeFromWatchlist` | **verified** — item confirmed absent afterwards |
-| `addToWatchlist` | **pending** — a 200 was only ever observed on an item already present |
+| `addToWatchlist` | **verified** — absent → present, `totalSize` 455 → 456 |
 
 Search results themselves carry **no** external IDs — only `guid:
 plex://show/{key}`. The IDs come from the second call, which is why verification
