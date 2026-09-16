@@ -123,6 +123,13 @@ export async function submit(deps: SyncDeps, gate: Gate, ops: Op[], dated: Dated
   const applied = ops.filter(o => appliedIds.has(o.opId))
   const rejected = ops.filter(o => !appliedIds.has(o.opId))
 
+  // Ordering trade-off, known and accepted: mirrorApplied runs BEFORE
+  // correctDates below. If date correction then 401s (or otherwise fails),
+  // sync_state already records the episode as watched, so nothing later
+  // infers "not yet backfilled" and revisits it -- the push-time date sticks
+  // until the recorded applyDates failure is replayed by hand. Reordering
+  // would leave a confirmed write unmirrored on a date-correction hiccup,
+  // which is worse, so this is deliberate, not an oversight.
   if (applied.length) mirrorApplied(deps, applied)
 
   if (rejected.length) {
@@ -166,6 +173,9 @@ export async function flushOutbox(deps: SyncDeps, gate: Gate): Promise<number> {
       const next = new Date(Date.now() + backoffMs(deps.store.attemptsFor(o.opId))).toISOString()
       deps.store.reschedule(o.opId, next)
     }
+    // Same known ordering trade-off as in submit() above: mirrorApplied runs
+    // before correctDates, so a date-correction failure below leaves the
+    // push-time date on a row sync_state already marks watched.
     if (applied.length) mirrorApplied(deps, applied as Op[])
 
     // The dated half of the original Plan, restored from the outbox: without

@@ -88,6 +88,10 @@ async function main() {
       const days = auth.daysRemaining()
       console.log('[auth] expiresAt', expiresAt, `(${days} days)`)
       // A successful heartbeat means the session works again, so writing may resume.
+      // This line IS reachable at runtime (beat() runs on the setInterval below,
+      // and on a healthy heartbeat after a halt, gate.clear() fires). It is only
+      // untestable, because beat is a closure inside main() and not exported --
+      // do not delete it as dead code on the strength of a coverage report.
       if (gate.halted) { gate.clear(); console.log('[auth] session healthy, resuming writes') }
       if (days != null && days < 30) await notify(config.notifyUrl, `Bingers session expires in ${days} days — re-capture needed`)
     } catch (e) {
