@@ -33,11 +33,21 @@ export async function fetchShowIds(deps: PlexDeps, ratingKey: string): Promise<E
 
 export async function fetchAllLeaves(deps: PlexDeps, ratingKey: string): Promise<PlexEpisode[]> {
   const b = await plexGet<{ MediaContainer?: { Metadata?: any[] } }>(deps, `/library/metadata/${ratingKey}/allLeaves`)
-  return (b.MediaContainer?.Metadata ?? []).map(m => ({
-    season: Number(m.parentIndex),
-    number: Number(m.index),
-    viewCount: Number(m.viewCount ?? 0),
-    lastViewedAt: m.lastViewedAt != null ? Number(m.lastViewedAt) : null,
-    title: m.title ?? null,
-  }))
+  const out: PlexEpisode[] = []
+  for (const m of b.MediaContainer?.Metadata ?? []) {
+    const season = Number(m.parentIndex)
+    const number = Number(m.index)
+    // A leaf without a usable season/episode number cannot be matched to
+    // anything downstream -- carrying it as NaN would poison every lookup
+    // keyed on it, so it is excluded rather than passed through.
+    if (!Number.isFinite(season) || !Number.isFinite(number)) continue
+    out.push({
+      season,
+      number,
+      viewCount: Number(m.viewCount ?? 0),
+      lastViewedAt: m.lastViewedAt != null ? Number(m.lastViewedAt) : null,
+      title: m.title ?? null,
+    })
+  }
+  return out
 }

@@ -12,6 +12,9 @@ describe('parseGuids', () => {
   it('ignores schemes we do not match on', () => {
     expect(parseGuids([{ id: 'plex://show/abc' }, { id: 'tmdb://5' }])).toEqual({ tmdb: '5' })
   })
+  it('keeps the first id when a scheme appears more than once', () => {
+    expect(parseGuids([{ id: 'tmdb://111' }, { id: 'tmdb://222' }])).toEqual({ tmdb: '111' })
+  })
 })
 
 describe('fetchShowIds', () => {
@@ -28,6 +31,11 @@ describe('fetchShowIds', () => {
     const f = stub({ MediaContainer: { Metadata: [{}] } })
     expect(await fetchShowIds(deps(f), '1')).toEqual({})
   })
+
+  it('throws on a non-2xx response', async () => {
+    const f = vi.fn(async () => new Response('nope', { status: 500 }))
+    await expect(fetchShowIds(deps(f), '1')).rejects.toThrow(/500/)
+  })
 })
 
 describe('fetchAllLeaves', () => {
@@ -42,5 +50,16 @@ describe('fetchAllLeaves', () => {
     expect(eps).toHaveLength(3)
     expect(eps[1]).toEqual({ season: 1, number: 2, viewCount: 0, lastViewedAt: null, title: 'Unwatched' })
     expect(eps[2]).toEqual({ season: 1, number: 3, viewCount: 2, lastViewedAt: 1789553428, title: 'Sales Contest' })
+  })
+
+  it('excludes leaves with no usable season/episode number instead of carrying NaN', async () => {
+    const f = stub({ MediaContainer: { Metadata: [
+      { parentIndex: 1, index: 1, viewCount: 1, lastViewedAt: 1789000000, title: 'Pilot' },
+      { index: 2, title: 'No season' },
+      { parentIndex: 1, title: 'No episode number' },
+    ] } })
+    const eps = await fetchAllLeaves(deps(f), '90363')
+    expect(eps).toHaveLength(1)
+    expect(eps[0]!.title).toBe('Pilot')
   })
 })

@@ -14,8 +14,12 @@ describe('searchTitles', () => {
     expect(r).toHaveLength(2)
     expect(r[0]!.id).toBe('019f6bb9-65cf-78d1-b123-f9ed891fe9d7')
     const [url, init] = (f as any).mock.calls[0]
-    expect(url).toContain('https://api.bingers.app/search/titles?q=tires')
+    expect(url).toBe('https://api.bingers.app/search/titles?q=tires&page=0&lang=de')
     expect(init?.headers?.Cookie).toBeUndefined()
+  })
+
+  it('throws on a non-200 so the caller can retry', async () => {
+    await expect(searchTitles('tires', 0, stub({}, 500) as any)).rejects.toThrow(/500/)
   })
 })
 
@@ -54,6 +58,16 @@ describe('externalIdMap', () => {
   it('ignores sources we do not match on', () => {
     const m = { external_ids: [{ id: 'Q1', source: 'wikidata' }, { id: '5', source: 'tmdb' }] } as any
     expect(externalIdMap(m)).toEqual({ tmdb: '5' })
+  })
+
+  it('keeps the first id when a source appears more than once', () => {
+    const m = {
+      external_ids: [
+        { id: '111', source: 'tmdb' },
+        { id: '222', source: 'tmdb' },
+      ],
+    } as any
+    expect(externalIdMap(m)).toEqual({ tmdb: '111' })
   })
 })
 

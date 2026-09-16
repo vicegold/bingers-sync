@@ -53,6 +53,32 @@ describe('resolveTitle', () => {
     expect(r).toHaveProperty('failure')
   })
 
+  it('checks a second page when the first page has no intersecting candidate', async () => {
+    const f = vi.fn(async (url: string) => {
+      if (url.includes('page=0')) {
+        return new Response(JSON.stringify({
+          results: [{ id: 'T-PAGE0', kind: 'show', metadata: 'hashA', card: { originalTitle: 'Tires', titlesI18n: {}, year: 2024 } }],
+        }), { status: 200 })
+      }
+      if (url.includes('page=1')) {
+        return new Response(JSON.stringify({
+          results: [{ id: 'T-PAGE1', kind: 'show', metadata: 'hashB', card: { originalTitle: 'Tires', titlesI18n: {}, year: 2024 } }],
+        }), { status: 200 })
+      }
+      if (url.includes('metadata@hashA')) {
+        return new Response(JSON.stringify({ id: 'T-PAGE0', title: 'Tires', year: 2024, kind: 'show', external_ids: [{ id: '111111', source: 'tmdb' }] }), { status: 200 })
+      }
+      if (url.includes('metadata@hashB')) {
+        return new Response(JSON.stringify({ id: 'T-PAGE1', title: 'Tires', year: 2024, kind: 'show', external_ids: [{ id: '247522', source: 'tmdb' }] }), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+    const r = await resolveTitle({ store, fetchImpl: f as typeof fetch, searchMaxPages: 2 }, { title: 'Tires', kind: 'show', ids: { tmdb: '247522' } })
+    expect(r).toEqual({ titleId: 'T-PAGE1' })
+    const pageUrls = (f as any).mock.calls.map((c: any[]) => c[0]).filter((u: string) => u.includes('/search/titles'))
+    expect(pageUrls).toHaveLength(2)
+  })
+
   it('fails cleanly when search returns nothing', async () => {
     const f = routed({ '/search/titles': { results: [] } })
     const r = await resolveTitle(deps(f), { title: 'Nothing', kind: 'show', ids: { tmdb: '1' } })
