@@ -2157,6 +2157,8 @@ backoff; a 401 must stop writing without losing queued work.
 **Files:**
 - Modify: `src/store.ts` (append outbox methods to the returned object)
 - Create: `src/outbox.ts`
+- Modify: `src/handlers.ts` (Step 6 — `AppDeps.gate`, write through `submit`)
+- Modify: `tests/handlers.test.ts` (Step 6 — pass `gate` in the deps helper)
 - Test: `tests/outbox.test.ts`
 
 **Interfaces:**
