@@ -78,7 +78,7 @@ Cookie: __Secure-better-auth.session_token=<token>
 
 ```
 GET  /sync/pull?follows={cursor}&entries={cursor}&catalog={cursor}&prefs={cursor}
-                &settings={cursor}&notifKinds=2&titlesLang=de&trigger=foreground
+                &settings={cursor}&notifKinds=2&titlesLang=de&trigger={trigger}
 → { imports, follows[], entries[], lists[], listItems[], catalog[],
     prefs[], settings[], notifications[], entriesTotal, cursors{} }
 
@@ -86,6 +86,44 @@ POST /sync/push
   { clientBatchId: uuid, ops: [ { opId: uuid, table, pk, fields } ] }
 → { results: [ { opId, status: "applied" } ], rows: { ... } }
 ```
+
+Cursors are plain ISO timestamps except `entries`, which is compound:
+`{iso}~{entityKind}~{entityId}`, e.g.
+`2026-09-16T09:22:30.211000Z~episode~019f6bb0-1f99-7645-bdac-64c4d84149df`.
+
+`trigger` is a free-form label; values observed are `boot`, `foreground`,
+`follow` and `follow-synced`.
+
+### Push op shapes — verified
+
+Both captured from real traffic. **The client sends flags, not timestamps; the
+server stamps the times.**
+
+```jsonc
+// follow a title (observed when adding a show to the watchlist)
+{ "opId": "<uuid>", "table": "follows",
+  "pk": { "titleId": "019f6bb9-65cf-78d1-b123-f9ed891fe9d7" },
+  "fields": { "kind": "show", "forLater": false,
+              "stopped": false, "watchlistHidden": false } }
+
+// mark an episode watched
+{ "opId": "<uuid>", "table": "entries",
+  "pk": { "entityKind": "episode", "entityId": "019f6bb9-65fd-7ef3-8053-8e3333a9f117" },
+  "fields": { "watched": true, "plays": 1, "batchId": null } }
+```
+
+Note what is *absent*: no `followedAt`, no `firstWatchedAt`, no `lastWatchedAt`.
+The `sync/push` response for the entries op returns the stored row with
+`firstWatchedAt` and `lastWatchedAt` both set to server receipt time. The push
+fields are booleans (`forLater`, `stopped`, `watchlistHidden`) where the pull rows
+carry timestamps (`forLaterAt`, `stoppedWatchingAt`, `watchlistHiddenAt`) — the
+server converts.
+
+**Consequence: watch times cannot be backdated** through the shapes the app uses.
+A scrobble that arrives late, and every backfilled episode, will be stamped
+"now". Whether the server also *accepts* a client-supplied `firstWatchedAt` is
+untested and should be probed once during implementation; if it does, use
+Plex's `lastViewedAt`, otherwise accept server time.
 
 Row shapes observed in `sync/pull`:
 
@@ -103,21 +141,33 @@ Other routes seen but unused here: `GET /me`, `/me/following`,
 `/me/follow-requests`, `/me/follows/rails`, `/stats/titles/{titleId}`,
 `PUT /devices`.
 
+### Realtime
+
+There is none. Neither capture contains an `Upgrade:` header,
+`Sec-WebSocket-*`, a `101 Switching Protocols`, a `text/event-stream`, or any
+`ws://`/`wss://` URL, and only two hosts are ever contacted (`api` and
+`catalog`). Sync is strictly poll-driven, triggered on app lifecycle and user
+action. Out-of-band delivery to the app is APNs push via Expo, registered with
+`PUT /devices` and surfaced through `notifKinds` — not a data channel.
+
 ### Verified vs assumed
 
 | Item | Status |
 |---|---|
 | `search/titles` is public | **verified** — 200 with no cookie |
 | Catalog paths and shapes above | **verified** — fetched directly |
-| `entries` push op for an episode | **verified** — observed in capture |
-| `sync/pull` row shapes | **verified** — observed in capture |
+| `entries` push op for an episode | **verified** — observed in both captures |
+| `follows` push op | **verified** — observed in capture 2 |
+| Server stamps watch/follow times; client sends flags | **verified** — push body vs. returned row |
+| `sync/pull` row shapes and cursor formats | **verified** — observed in capture |
 | Cookie auth, no CSRF | **verified** — observed in capture |
-| `follows` push op shape | **assumed** — mirrored from the pull row |
+| No websocket/SSE channel exists | **verified** — absent from both captures |
 | Movie entry: `entityKind: "movie"`, `entityId` = titleId | **assumed** |
-| `watchlist.removed` → `deletedAt` soft delete | **assumed** |
+| Unfollow shape (likely `fields: { deleted: true }`) | **assumed** |
+| Server accepts client-supplied watch timestamps | **untested** — probe once |
 | Session `expiresAt` slides forward on use | **assumed** — see Auth |
 
-The three assumed write shapes are why the service ships with `DRY_RUN=true`.
+The remaining assumed write shapes are why the service ships with `DRY_RUN=true`.
 
 ## Architecture
 
@@ -299,8 +349,11 @@ body. Accepted only when `Account.title === "plexuser"`.
    that is not already watched.
 5. Push as one batch.
 
-`firstWatchedAt` / `lastWatchedAt` come from `Metadata.lastViewedAt` when present,
-otherwise receipt time. `plays` uses `Metadata.viewCount` when present, else 1.
+`plays` uses `Metadata.viewCount` when present, else 1. Watch timestamps are
+**not** sent — the server stamps them on receipt (see Push op shapes). Plex's
+`lastViewedAt` is recorded locally in `outbox` so that, if the timestamp probe
+shows the server accepts client-supplied times, the behaviour can be switched on
+without re-deriving anything.
 
 **Backfill excludes season 0.** Specials appear in `requiredSeasons` and would
 otherwise be swept up by watching a later regular episode. Ordering is by
@@ -310,8 +363,11 @@ otherwise be swept up by watching a later regular episode. Ordering is by
 
 JSON body. Accepted only when `data.addedBy.username === "plexuser"`.
 
-- `added` → `follows` op with `followedAt`
-- `removed` → `follows` op with `deletedAt` (soft delete, as the app does)
+- `added` → `follows` op with `fields: { kind, forLater: false, stopped: false,
+  watchlistHidden: false }` (verified shape)
+- `removed` → `follows` op soft-deleting the row; exact field name unverified,
+  most likely `{ deleted: true }` by analogy with the flag/timestamp split. Confirm
+  before enabling.
 
 ### Local mirror
 
