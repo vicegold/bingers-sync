@@ -12,6 +12,14 @@ Mirrors Plex scrobbles and Pulsarr watchlist changes into Bingers.
 3. `docker compose up -d` — pulls `ghcr.io/vicegold/bingers-sync:latest`, published
    by CI on every push to main. To build from source instead:
    `docker compose --profile dev up -d --build bingers-sync-dev`
+
+   Every variable the service reads is listed explicitly under `environment:` in
+   `docker-compose.yml`, so that file is the reference for what is configurable.
+   Values are interpolated from `.env`; the container is never handed the file.
+   Required variables use `${VAR:?...}`, so compose refuses to start rather than
+   booting half-configured. Leave `DB_PATH` unset — its default points inside the
+   bind mount, and a relative path would put the outbox inside the container where
+   it dies on restart.
 4. Point Plex and Pulsarr at the service. Use the host's **IP**, not a hostname:
 
    | Webhook | URL |
