@@ -1,0 +1,424 @@
+# bingers-sync — design
+
+**Date:** 2026-09-16
+**Status:** approved, pending implementation plan
+
+## Purpose
+
+Mirror watch activity and watchlist changes into [Bingers](https://bingers.app),
+which has no public API, by consuming two webhooks that already exist on the
+local network:
+
+- **Plex** `media.scrobble` → mark the episode or movie watched on Bingers
+- **Pulsarr** `watchlist.added` / `watchlist.removed` → follow / unfollow on Bingers
+
+Both are filtered to the single user `plexuser`. Everything else is ignored.
+
+## Constraints
+
+- Bingers' API is private and undocumented. It can change without notice; the
+  service is expected to need occasional repair.
+- Every mapping between an external ID and a Bingers ID must be **verified**
+  before anything is written. No title-similarity guessing.
+- Request volume against Bingers must stay low. The local cache, not politeness
+  in the request loop, is what achieves this.
+- The only write credential is a session cookie obtained by capturing the app's
+  traffic. It cannot be minted programmatically.
+
+## Protocol reference
+
+Derived from two Proxyman captures of Bingers iOS `0.2.0+55` plus direct probing
+of the public endpoints. Marked **verified** where observed in traffic or
+reproduced directly, **assumed** where inferred.
+
+### Public, no authentication
+
+Confirmed by request with no cookie, returning 200.
+
+```
+GET https://api.bingers.app/search/titles?q={query}&page=0&lang=de
+→ { results: [ { id, kind, metadata, card: { originalTitle, originalLanguage,
+                                              titlesI18n, posterRef, year } } ] }
+
+GET https://catalog.bingers.app/catalog/{titleId}/versions.json
+→ { titleId, kind, files: { metadata, credits, images, similar, videos,
+                            "watch-providers",
+                            metadataByLang: { <lang>: hash },
+                            seasons: { "<n>": hash },
+                            seasonsByLang: { <lang>: { "<n>": hash } } } }
+
+GET https://catalog.bingers.app/catalog/{titleId}/metadata@{hash}.json
+→ { id, title, original_title, year, kind, seasons: [...], status,
+    external_ids: [ { id, source, type, url } ] }
+    # source ∈ imdb | tmdb | tvdb | tv maze | wikidata | wikipedia | ...
+
+GET https://catalog.bingers.app/catalog/{titleId}/season-{n}@{hash}.json
+→ { episodes: [ { n, abs, id, title, overview, aired, air_utc, runtime, img } ] }
+
+GET https://catalog.bingers.app/explore/v1/generations/{ts}/{show|movie}/{popular|trending}/{lang}.json
+→ { generatedAt, generation, kind, list, locale, schemaVersion,
+    items: [ { id, title, year, metadata, provider: { id, source, type }, ... } ] }   # 2000 items
+```
+
+The `{kind}@{hash}.json` path convention is the key to the whole catalog. Hashes
+come from `versions.json` and change when Bingers re-publishes a title.
+
+The explore generations are the only bulk listing, and they do carry an external
+ID inline via `provider`. They are **not** a usable reverse index: 2000 popular
+titles is not the catalog, and `titleId` is a UUIDv7, so the ID space cannot be
+enumerated. Resolution is therefore on-demand plus cache.
+
+### Authenticated
+
+Single credential, no CSRF token:
+
+```
+Cookie: __Secure-better-auth.session_token=<token>
+```
+
+```
+GET  /sync/pull?follows={cursor}&entries={cursor}&catalog={cursor}&prefs={cursor}
+                &settings={cursor}&notifKinds=2&titlesLang=de&trigger=foreground
+→ { imports, follows[], entries[], lists[], listItems[], catalog[],
+    prefs[], settings[], notifications[], entriesTotal, cursors{} }
+
+POST /sync/push
+  { clientBatchId: uuid, ops: [ { opId: uuid, table, pk, fields } ] }
+→ { results: [ { opId, status: "applied" } ], rows: { ... } }
+```
+
+Row shapes observed in `sync/pull`:
+
+```
+follows: { titleId, kind, isFavorite, favoritePosition, preferredPosterKey,
+           preferredBackdropKey, preferredLogoKey, forLaterAt, stoppedWatchingAt,
+           watchlistHiddenAt, backfillOptOut, followedAt, updatedAt, deletedAt }
+
+entries: { entityKind, entityId, watched, plays, firstWatchedAt, lastWatchedAt,
+           rating, feeling, favoritePersonId, favoriteCharacterId, batchId,
+           updatedAt, deletedAt }
+```
+
+Other routes seen but unused here: `GET /me`, `/me/following`,
+`/me/follow-requests`, `/me/follows/rails`, `/stats/titles/{titleId}`,
+`PUT /devices`.
+
+### Verified vs assumed
+
+| Item | Status |
+|---|---|
+| `search/titles` is public | **verified** — 200 with no cookie |
+| Catalog paths and shapes above | **verified** — fetched directly |
+| `entries` push op for an episode | **verified** — observed in capture |
+| `sync/pull` row shapes | **verified** — observed in capture |
+| Cookie auth, no CSRF | **verified** — observed in capture |
+| `follows` push op shape | **assumed** — mirrored from the pull row |
+| Movie entry: `entityKind: "movie"`, `entityId` = titleId | **assumed** |
+| `watchlist.removed` → `deletedAt` soft delete | **assumed** |
+| Session `expiresAt` slides forward on use | **assumed** — see Auth |
+
+The three assumed write shapes are why the service ships with `DRY_RUN=true`.
+
+## Architecture
+
+Node + TypeScript (Hono) in Docker on FC10, SQLite on a mounted volume.
+Plex and Pulsarr are both on the local network, so the service listens on plain
+HTTP with no public exposure.
+
+```
+Plex ──multipart/form-data──┐
+                            ├─→ filter(plexuser) ─→ resolve() ─→ plan() ─→ push()
+Pulsarr ──application/json──┘         │                │                    │
+                                      │                │                    ↓
+                                      │                └── SQLite ──→ api.bingers.app
+                                      └── plex API + catalog.bingers.app
+```
+
+```
+src/
+  server.ts              Hono app, two routes, health
+  routes/plex.ts         media.scrobble  (multipart)
+  routes/pulsarr.ts      watchlist.added / .removed  (json)
+  plex/client.ts         show guid lookup by ratingKey
+  bingers/search.ts      search/titles
+  bingers/catalog.ts     versions.json, metadata@, season-@
+  bingers/sync.ts        sync/pull, sync/push
+  bingers/auth.ts        cookie jar, heartbeat, expiry tracking
+  resolve.ts             external ids → titleId / episodeId
+  plan.ts                events → ops (follow, watched, backfill)
+  store.ts               SQLite
+  notify.ts              failure notifications
+```
+
+### Module boundaries
+
+`resolve.ts` is the only module that maps external identity to Bingers identity,
+and it returns either a verified ID or a failure — never a guess. `plan.ts` turns
+a resolved event into a list of ops without performing I/O, which makes the
+behavioural rules (auto-follow, backfill, specials exclusion) testable in
+isolation. `bingers/sync.ts` is the only module that writes.
+
+## Resolution
+
+Both sources converge on a set of **show-level** external IDs, then take the same
+path.
+
+```
+Plex episode:
+  Metadata.grandparentRatingKey
+    → GET {PLEX_URL}/library/metadata/{key}?includeGuids=1   (X-Plex-Token)
+    → Guid[] → { tmdb, tvdb, imdb } for the SHOW
+
+Plex movie:
+  Metadata.Guid[] is already movie-level → use directly
+
+Pulsarr:
+  data.content.guids → { tmdb, tvdb, imdb } directly
+```
+
+The Plex callback is necessary because a `media.scrobble` payload's `Guid[]`
+identifies the **episode**, not the show. In the reference payload, the episode
+carries `tmdb://5175711` while the show *Tires* is `tmdb 247522`. Bingers season
+files key episodes by position with no external IDs of their own, so the episode
+GUIDs are unusable for matching at either level.
+
+Then:
+
+```
+1. cache hit on (source, ext_id)?            → titleId, done
+2. GET search/titles?q={title}
+3. for each result where kind matches:
+     GET catalog/{id}/metadata@{metadata}.json
+     if external_ids ∩ our guids ≠ ∅        → titleId, verified
+4. no intersection after SEARCH_MAX_PAGES     → failure
+```
+
+Search is by text but the **decision is by ID intersection**, so a localised or
+mistyped title costs at most a wasted search, never a wrong write.
+
+### Episode resolution and the cache
+
+On first resolution of a show, the service fetches `versions.json` and then
+**every** season file, storing the complete episode map in one pass. Subsequent
+episodes of that show resolve from SQLite with no network calls at all.
+
+A cache miss on `(titleId, season, number)` — a newly aired episode — triggers a
+re-fetch of `versions.json`; any season whose hash changed is re-fetched and
+upserted. `versions.json` is also re-checked on a TTL (default 24h) for followed
+shows.
+
+## Storage
+
+```sql
+CREATE TABLE title_map (               -- external identity → bingers identity
+  source      TEXT NOT NULL,           -- 'tmdb' | 'tvdb' | 'imdb'
+  ext_id      TEXT NOT NULL,
+  kind        TEXT NOT NULL,           -- 'show' | 'movie'
+  title_id    TEXT NOT NULL,
+  title       TEXT,
+  year        INTEGER,
+  verified_at TEXT NOT NULL,
+  PRIMARY KEY (source, ext_id, kind)
+);
+CREATE INDEX title_map_title_id ON title_map (title_id);
+
+CREATE TABLE episode_map (             -- (show, season, number) → bingers episode
+  title_id    TEXT NOT NULL,
+  season      INTEGER NOT NULL,
+  number      INTEGER NOT NULL,
+  episode_id  TEXT NOT NULL,
+  abs         INTEGER,
+  title       TEXT,
+  aired       TEXT,
+  season_hash TEXT NOT NULL,
+  fetched_at  TEXT NOT NULL,
+  PRIMARY KEY (title_id, season, number)
+);
+CREATE INDEX episode_map_episode_id ON episode_map (episode_id);
+
+CREATE TABLE catalog_version (         -- last seen versions.json per title
+  title_id   TEXT PRIMARY KEY,
+  files_json TEXT NOT NULL,
+  fetched_at TEXT NOT NULL
+);
+
+CREATE TABLE sync_state (              -- local mirror from sync/pull
+  table_name TEXT NOT NULL,            -- 'follows' | 'entries'
+  pk         TEXT NOT NULL,            -- titleId, or entityKind:entityId
+  row_json   TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (table_name, pk)
+);
+
+CREATE TABLE cursors (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+
+CREATE TABLE outbox (                  -- pending / retrying ops
+  op_id       TEXT PRIMARY KEY,
+  batch_id    TEXT,
+  table_name  TEXT NOT NULL,
+  pk_json     TEXT NOT NULL,
+  fields_json TEXT NOT NULL,
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  next_try_at TEXT,
+  status      TEXT NOT NULL,           -- 'pending' | 'applied' | 'failed'
+  created_at  TEXT NOT NULL
+);
+
+CREATE TABLE failures (                -- unresolvable events, for manual review
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  source      TEXT NOT NULL,           -- 'plex' | 'pulsarr'
+  reason      TEXT NOT NULL,
+  payload     TEXT NOT NULL,
+  created_at  TEXT NOT NULL
+);
+
+CREATE TABLE auth_state (              -- session token + observed expiry history
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  cookie      TEXT NOT NULL,
+  expires_at  TEXT,
+  rotated_at  TEXT,
+  checked_at  TEXT
+);
+```
+
+`title_map` holds one row per external ID per title, so a show resolved via TMDB
+is also found later via TVDB or IMDb without re-searching.
+
+## Behaviour
+
+### Plex `media.scrobble`
+
+Plex posts `multipart/form-data` with the JSON in a `payload` part — not a JSON
+body. Accepted only when `Account.title === "plexuser"`.
+
+1. Resolve show (episodes) or movie IDs as above.
+2. If the title is not in `follows`, emit a `follows` op first.
+3. Emit an `entries` op: `entityKind: "episode"` with the resolved `episodeId`, or
+   `entityKind: "movie"` with the `titleId`.
+4. Backfill: emit `entries` ops for every episode ordered before the scrobbled one
+   that is not already watched.
+5. Push as one batch.
+
+`firstWatchedAt` / `lastWatchedAt` come from `Metadata.lastViewedAt` when present,
+otherwise receipt time. `plays` uses `Metadata.viewCount` when present, else 1.
+
+**Backfill excludes season 0.** Specials appear in `requiredSeasons` and would
+otherwise be swept up by watching a later regular episode. Ordering is by
+`(season, number)` over seasons ≥ 1.
+
+### Pulsarr `watchlist.added` / `watchlist.removed`
+
+JSON body. Accepted only when `data.addedBy.username === "plexuser"`.
+
+- `added` → `follows` op with `followedAt`
+- `removed` → `follows` op with `deletedAt` (soft delete, as the app does)
+
+### Local mirror
+
+`sync/pull` runs at boot and every `SYNC_PULL_INTERVAL_MIN`, using stored cursors
+so each run is incremental. It populates `sync_state`, which is what the
+auto-follow check, the backfill "already watched" filter and idempotency all read
+from — none of them query Bingers per event.
+
+### Idempotency
+
+Keyed on `(entityKind, entityId)` against `sync_state`. A repeat scrobble of an
+already-watched episode updates `lastWatchedAt` and `plays` rather than creating a
+duplicate. `opId` and `clientBatchId` are fresh UUIDs per push.
+
+### Failure handling
+
+| Case | Response |
+|---|---|
+| Unresolvable / unverified | row in `failures`, notification, **HTTP 200** |
+| Bingers 5xx, network error | `outbox` retry with exponential backoff |
+| Bingers 401 | stop writing, keep queueing, notify |
+| Wrong user, other event types | ignore, HTTP 200 |
+
+HTTP 200 on unresolvable events is deliberate: Plex retries on non-2xx, and
+retrying something that will never resolve only generates noise.
+
+## Auth lifecycle
+
+`__Secure-better-auth.session_token` is the only write credential, obtained by
+capturing app traffic. Observed session: created `2026-09-16T08:20:14Z`, expires
+`2027-09-16T08:20:14Z` — exactly 365 days, against better-auth's 7-day default,
+so the long window is deliberate.
+
+Route probing (no credentials sent):
+
+| Route | Result | Meaning |
+|---|---|---|
+| `POST /auth/refresh-token` | 400, requires `providerId` | refreshes the **Apple** OAuth token, not the session — not usable |
+| `GET /auth/token` | 401 | bearer/JWT plugin exists, mints from a session |
+| `GET /auth/list-sessions` | 401 | exists, exposes `expiresAt` |
+| `GET /auth/get-session` | 200 | what the app calls |
+
+There is no session refresh token. better-auth instead uses a rolling session:
+once `updateAge` elapses, the next authenticated request slides `expiresAt`
+forward and re-issues the cookie. Neither capture is old enough to show a
+rotation — both are within ~2h of session creation — so this is inference, not
+observation. The only `Set-Cookie` seen is `session_data` with `Max-Age=300`,
+which is better-auth's 5-minute cache, not a credential.
+
+The design does not depend on which case is true:
+
+1. **Persistent cookie jar** — every response is inspected for a `session_token`
+   `Set-Cookie`; a rotation is written back to `auth_state` immediately.
+2. **Daily heartbeat** — `GET /auth/get-session?disableCookieCache=true`, which is
+   what triggers the sliding refresh, recording `session.expiresAt`.
+3. **Expiry monitoring** — warn at 30 days remaining.
+
+This self-verifies within a day or two of running: if the recorded `expires_at`
+moves, the session is rolling and needs no further attention; if it stays pinned,
+it is a fixed annual session and the warning gives a month's notice. Worst case is
+one manual re-capture per year.
+
+`GET /auth/token` should be tried once with a live session during implementation.
+If it yields a usable bearer token, `Authorization: Bearer` is a cleaner transport
+than replaying a browser cookie — but such tokens are typically shorter-lived than
+the session, so this is a possible refinement, not a dependency.
+
+## Configuration
+
+```
+BINGERS_SESSION_COOKIE=    # __Secure-better-auth.session_token value
+PLEX_URL=                  # http://plex.local:32400
+PLEX_TOKEN=
+ALLOWED_USER=plexuser      # Plex Account.title and Pulsarr addedBy.username
+DRY_RUN=true               # default; log intended pushes without sending
+PORT=8787
+DB_PATH=/data/bingers-sync.db
+CATALOG_TTL_HOURS=24
+SEARCH_MAX_PAGES=3         # search/titles pages scanned before declaring failure
+SYNC_PULL_INTERVAL_MIN=30  # refresh of the local follows/entries mirror
+NOTIFY_URL=                # webhook for failure notifications
+```
+
+## Testing
+
+- **resolve.ts** — fixtures from both real captures plus the two reference
+  payloads. Cases: exact ID match; multiple candidates where only one intersects;
+  zero intersection → failure; cache hit avoids all network calls.
+- **plan.ts** — pure function, no I/O. Cases: unfollowed show emits follow first;
+  backfill spans seasons and **excludes season 0**; already-watched episode
+  produces no duplicate; movie produces `entityKind: "movie"`.
+- **Webhook parsing** — Plex multipart with a real captured body; Pulsarr JSON;
+  both rejected for a user other than `plexuser`.
+- **Auth** — cookie rotation is persisted; 401 halts writes without dropping
+  queued ops.
+- Bingers HTTP is stubbed in tests. No test touches the live API.
+
+## Rollout
+
+1. Capture one "add to watchlist" action in the app to confirm the `follows` push
+   op shape. Correct the spec if it differs.
+2. Run with `DRY_RUN=true` and replay both reference payloads; confirm the planned
+   ops are correct.
+3. Flip `DRY_RUN=false` for a single known episode; verify in the app.
+4. Point the real Plex and Pulsarr webhooks at the service.
+
+## Out of scope
+
+Bingers → Plex direction; ratings and feelings; lists beyond the watchlist;
+multi-user support; any UI.
