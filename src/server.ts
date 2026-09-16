@@ -33,9 +33,30 @@ export function createApp(deps: AppDeps) {
   // Always 200: a non-2xx makes Plex retry an event that will never resolve.
   app.post('/plex', async c => {
     try {
-      const s = parsePlexScrobble(await c.req.formData())
-      if (!s) return c.json({ status: 'ignored' })
-      return c.json(await handlePlex(deps, s))
+      const form = await c.req.formData()
+      // Log EVERY inbound event, including ones we drop. Without this, "nothing
+      // happened" is indistinguishable from "never arrived" -- plex sends ~12
+      // event types and only media.scrobble is actionable.
+      const raw = form.get('payload')
+      let ev = '<no payload part>', who = '?'
+      if (typeof raw === 'string') {
+        try {
+          const p = JSON.parse(raw) as { event?: string; Account?: { title?: string } }
+          ev = p?.event ?? '<no event>'
+          who = p?.Account?.title ?? '<no account>'
+        } catch { ev = '<unparseable json>' }
+      }
+      const s = parsePlexScrobble(form)
+      if (!s) {
+        console.log(`[plex] in  event=${ev} account=${who} -> ignored (not an actionable scrobble)`)
+        return c.json({ status: 'ignored' })
+      }
+      const res = await handlePlex(deps, s)
+      const what = s.type === 'episode'
+        ? `${s.grandparentTitle} S${s.season}E${s.number}`
+        : `${s.title} (${s.year})`
+      console.log(`[plex] in  event=${ev} account=${who} ${what} -> ${res.status}${res.reason ? ` (${res.reason})` : ''}`)
+      return c.json(res)
     } catch (e) {
       // recordFailure can itself throw (e.g. the store is what failed) -- the
       // 200 below must not depend on that succeeding, or an unhealthy store
@@ -48,9 +69,17 @@ export function createApp(deps: AppDeps) {
 
   app.post('/pulsarr', async c => {
     try {
-      const e = parsePulsarr(await c.req.json())
-      if (!e) return c.json({ status: 'ignored' })
-      return c.json(await handlePulsarr(deps, e))
+      const body = await c.req.json() as { event?: string; data?: { addedBy?: { username?: string } } }
+      const ev = body?.event ?? '<no event>'
+      const who = body?.data?.addedBy?.username ?? '<no user>'
+      const e = parsePulsarr(body)
+      if (!e) {
+        console.log(`[pulsarr] in  event=${ev} user=${who} -> ignored`)
+        return c.json({ status: 'ignored' })
+      }
+      const res = await handlePulsarr(deps, e)
+      console.log(`[pulsarr] in  event=${ev} user=${who} ${e.title} -> ${res.status}${res.reason ? ` (${res.reason})` : ''}`)
+      return c.json(res)
     } catch (e) {
       try { deps.store.recordFailure('pulsarr', `handler threw: ${(e as Error).message}`, null) }
       catch (e2) { console.error('[pulsarr] recordFailure failed', (e2 as Error).message) }
