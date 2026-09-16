@@ -438,7 +438,13 @@ Plex posts `multipart/form-data` with the JSON in a `payload` part — not a JSO
 body. Accepted only when `Account.title === "plexuser"`.
 
 1. Resolve show (episodes) or movie IDs as above.
-2. If the title is not in `follows`, emit a `follows` op first.
+2. If the title is not currently followed, emit a `follows` op first — the same
+   op the app sends when it prompts "add to your list?". This applies to movies
+   as well as shows. **A previously removed title is re-followed**: a `follows`
+   row with `deletedAt` set is treated the same as no row at all. Watching
+   something is taken as intent to track it, matching the app's own prompt.
+   Deliberate removals of a show you keep watching in Plex will therefore come
+   back — that is the accepted trade for not having a second kind of state.
 3. Emit an `entries` op: `entityKind: "episode"` with the resolved `episodeId`, or
    `entityKind: "movie"` with the `titleId`. `plays` = `Metadata.viewCount` or 1.
 4. Backfill (episodes only) — see below.
@@ -630,15 +636,33 @@ live, instead of duplicating them here.
 ### Plex Discover endpoints
 
 ```
-PUT https://discover.provider.plex.tv/actions/addToWatchlist?ratingKey={key}
-PUT https://discover.provider.plex.tv/actions/removeFromWatchlist?ratingKey={key}
-      key = guid.rsplit('/', 1)[-1]        # plex://show/65df7412… → 65df7412…
-GET https://discover.provider.plex.tv/library/search?query=&limit=&searchTypes=&includeMetadata=1
+GET  {D}/library/search?query={q}&limit=5&searchTypes=tv&searchProviders=discover&includeMetadata=1
+GET  {D}/library/metadata/{ratingKey}?includeGuids=1
+GET  {D}/library/sections/watchlist/all         + container headers
+PUT  {D}/actions/addToWatchlist?ratingKey={key}
+PUT  {D}/actions/removeFromWatchlist?ratingKey={key}
+        D   = https://discover.provider.plex.tv
+        key = guid.rsplit('/', 1)[-1]      # plex://show/65df7412… → 65df7412…
 ```
 
-Endpoints taken from python-plexapi's `MyPlexAccount`, as used in production by
-PlexTraktSync. To be confirmed against the live account before the path is
-enabled.
+Probed against the live account:
+
+| Call | Result |
+|---|---|
+| `library/search` | **verified** — `searchProviders=discover` is **required**; omitting it returns 400 |
+| `library/metadata/{key}?includeGuids=1` | **verified** — returns `Guid: [imdb://…, tmdb://…, tvdb://…]` |
+| `library/sections/watchlist/all` | **verified** — pages via `X-Plex-Container-Start` / `-Size` **headers** (100/page; 500 → 400). `limit=` query param is ignored. `MediaContainer.totalSize` gives the true count |
+| `removeFromWatchlist` | **verified** — item confirmed absent afterwards |
+| `addToWatchlist` | **pending** — a 200 was only ever observed on an item already present |
+
+Search results themselves carry **no** external IDs — only `guid:
+plex://show/{key}`. The IDs come from the second call, which is why verification
+costs one metadata fetch per candidate.
+
+Also confirmed: **Pulsarr's `data.content.key` is the Plex Discover ratingKey.**
+`5d9c08353c3f87001f34a531` appears both in the Pulsarr payload for The Mentalist
+and as its Discover `guid`. Same ID space, so nothing needs looking up on that
+path.
 
 ### The Discover matching constraint
 
@@ -652,10 +676,13 @@ This is the one place the system cannot match the exactness of the forward path,
 where Bingers' `external_ids` make intersection trivial. The mitigation keeps the
 guarantee but concedes coverage:
 
-1. `searchDiscover(title)` for the Bingers title
-2. read each candidate's `Guid[]` (requires `includeMetadata=1`)
+1. `library/search` for the Bingers title, with `searchProviders=discover`
+2. for each candidate, `library/metadata/{key}?includeGuids=1` → its `Guid[]`
 3. write **only** on a tmdb/tvdb/imdb intersection with the Bingers IDs
 4. no intersection → `failures` row + notification, never a guess
+
+Step 2 is cached in `title_map` alongside the Bingers mapping, so a title is
+resolved through Discover at most once.
 
 So a Bingers follow that Discover cannot surface is reported rather than
 mismatched. Expect a non-zero rate of these; they are added by hand.
