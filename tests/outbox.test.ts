@@ -16,6 +16,7 @@ const mk = (f: any) => ({
   auth: createAuth(store, 'TOK', 'UA'), store, userAgent: 'UA',
   dryRun: false, watchDateToleranceSec: 120, fetchImpl: f as typeof fetch,
 })
+const mkDry = (f: any) => ({ ...mk(f), dryRun: true })
 // Body-aware: reports every op in the request as server-applied, so tests
 // that assert a full drain stay correct under the strict appliedIds-only
 // bookkeeping in flushOutbox (a partial-rejection response is stubbed
@@ -100,6 +101,20 @@ describe('flushOutbox', () => {
     const n = await flushOutbox(mk(partial), createGate())
     expect(n).toBe(1)
     expect(store.outboxDepth()).toBe(1)
+  })
+
+  it('does not drain the outbox under dry run: ops queued while live must survive a restart into DRY_RUN=true', async () => {
+    // Reachable sequence: run live, queue ops during an outage or a halted
+    // session (SQLite-backed, survives restart), then restart with
+    // DRY_RUN=true (the project default). flushOutbox must not treat
+    // pushOps's `{ dryRun: true }` no-op as a successful send.
+    await submit(mk(boom(500)), createGate(), [OP('1'), OP('2')])
+    expect(store.outboxDepth()).toBe(2)
+    const f = ok()
+    const n = await flushOutbox(mkDry(f), createGate())
+    expect(n).toBe(0)
+    expect(store.outboxDepth()).toBe(2)
+    expect(f).not.toHaveBeenCalled()
   })
 })
 

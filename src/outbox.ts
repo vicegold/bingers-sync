@@ -35,7 +35,15 @@ export async function flushOutbox(deps: SyncDeps, gate: Gate): Promise<number> {
   if (due.length === 0) return 0
   try {
     const result = await pushOps(deps, due as Op[])
-    const appliedIds = new Set('appliedIds' in result ? result.appliedIds : due.map(o => o.opId))
+    if ('dryRun' in result) {
+      // pushOps sent nothing (dry run) -- treat exactly like "no ops were
+      // applied" rather than the old fallback of assuming all of them were.
+      // Ops queued while live must survive a restart into DRY_RUN=true, not
+      // be silently marked applied on the next flush.
+      console.log('[DRY_RUN] flushOutbox: skipping, nothing applied for', due.length, 'queued op(s)')
+      return 0
+    }
+    const appliedIds = new Set(result.appliedIds)
     const applied = due.filter(o => appliedIds.has(o.opId))
     const rejected = due.filter(o => !appliedIds.has(o.opId))
     if (applied.length) deps.store.markApplied(applied.map(o => o.opId))
