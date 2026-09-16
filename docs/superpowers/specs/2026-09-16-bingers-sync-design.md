@@ -112,6 +112,39 @@ server stamps the times.**
   "fields": { "watched": true, "plays": 1, "batchId": null } }
 ```
 
+### Follow state ops — verified
+
+Capture 5 exercised all four actions in the title's context menu, on four
+different shows. The op envelope has **two forms**:
+
+```jsonc
+// A. update — fields carries the new state
+{ "opId": "…", "table": "follows", "pk": { "titleId": "…" },
+  "fields": { … } }
+
+// B. delete — `deleted` is an op-level sibling of `pk`, with NO "fields" key
+{ "opId": "3e2f58a0-…", "table": "follows", "pk": { "titleId": "019f6bb1-285b-…" },
+  "deleted": true }
+```
+
+| Menu action (de) | Meaning | `fields` sent |
+|---|---|---|
+| Von der Liste entfernen | unfollow | *(form B — `deleted: true`)* |
+| Nicht mehr schauen | stop watching | `{ stopped: true, forLater: false, kind }` |
+| Später schauen | watch later | `{ forLater: true, stopped: false, kind }` |
+| Aus der Watchlist ausblenden | hide from watchlist | `{ watchlistHidden: true, kind }` |
+
+Three things to preserve when writing follows ops:
+
+- `kind` is always sent alongside the flags.
+- `stopped` and `forLater` are **mutually exclusive** — setting either explicitly
+  clears the other in the same op.
+- `watchlistHidden` is independent and clears nothing.
+
+Form B is what `watchlist.removed` uses. Note it is *not* `fields: { deleted:
+true }` — a plausible-looking shape that would silently be an update with an
+unknown field rather than a delete.
+
 ### Batches — verified
 
 Capture 4 is the app's own "mark previous episodes as watched" flow. It sends
@@ -215,7 +248,8 @@ action. Out-of-band delivery to the app is APNs push via Expo, registered with
 | `GET`/`PATCH /me/watches` backdating flow | **verified** — observed in capture 3 |
 | `entityKind: "movie"` exists in entries | **verified** — seen in an entries cursor |
 | Movie `entityId` = titleId | **verified** — a captured movie entityId resolves in the catalog as `kind: movie` |
-| Unfollow shape (likely `fields: { deleted: true }`) | **assumed** |
+| Unfollow shape (op-level `deleted: true`) | **verified** — observed in capture 5 |
+| `stopped` / `forLater` / `watchlistHidden` ops | **verified** — observed in capture 5 |
 | Batched entries ops sharing a `batchId` | **verified** — observed in capture 4 |
 | `POST /me/watches` for one-step dated writes | **untested** — probe once |
 | `GET /me/watches?batchId=` for bulk read-back | **untested** — probe once |
@@ -450,9 +484,8 @@ JSON body. Accepted only when `data.addedBy.username === "plexuser"`.
 
 - `added` → `follows` op with `fields: { kind, forLater: false, stopped: false,
   watchlistHidden: false }` (verified shape)
-- `removed` → `follows` op soft-deleting the row; exact field name unverified,
-  most likely `{ deleted: true }` by analogy with the flag/timestamp split. Confirm
-  before enabling.
+- `removed` → `follows` op in delete form: `{ opId, table: "follows",
+  pk: { titleId }, deleted: true }` — no `fields` key (verified shape)
 
 ### Local mirror
 
