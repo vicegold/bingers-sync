@@ -4,7 +4,7 @@ import { loadConfig } from './config.js'
 import { openStore } from './store.js'
 import { createAuth } from './bingers/auth.js'
 import { parsePlexScrobble, parsePulsarr } from './routes/parse.js'
-import { handlePlex, handlePulsarr, mirrorFreshness, type AppDeps } from './handlers.js'
+import { handlePlex, handlePulsarr, mirrorFreshness, syncDeps, type AppDeps } from './handlers.js'
 import { pullOnce } from './bingers/sync.js'
 import { createGate, flushOutbox } from './outbox.js'
 import { notify } from './notify.js'
@@ -13,12 +13,30 @@ import { setupPage } from './routes/setup-page.js'
 
 /**
  * /setup is self-closing: it exists only to acquire a session cookie, so it
- * answers while there is none, and again once the one we had went dead (a 401
- * on any write path halts the gate). The rest of the time it is a 404, which
- * keeps a LAN neighbour from re-pointing the sync at their own account.
+ * answers while there is none and again once the one we had went dead. The rest
+ * of the time it is a 404.
+ *
+ * All three conditions are needed, and the gate alone is not enough. A halted
+ * gate only ever follows a 401 on a real WRITE -- and under DRY_RUN (the
+ * default) no write ever reaches the network, so a session can expire with the
+ * gate permanently open. auth.sessionDead() is what covers that: it sees both
+ * a 401 on a read and an expiresAt that has simply passed.
  */
 function setupOpen(deps: AppDeps): boolean {
-  return !deps.auth.hasSession() || deps.gate.halted
+  return !deps.auth.hasSession() || deps.auth.sessionDead() || deps.gate.halted
+}
+
+/**
+ * A form POST is a CORS-simple request, so any page the operator's browser
+ * loads can submit one at this port with no preflight and no need to read the
+ * reply. Browsers attach Origin to every cross-site form POST, so a mismatch is
+ * a drive-by. A request with no Origin at all is not from a browser (curl, the
+ * tests) and is left alone -- what stops a hostile LAN host is the account
+ * binding in the handler, not this.
+ */
+function sameOrigin(origin: string | undefined, url: string): boolean {
+  if (!origin) return true
+  try { return new URL(origin).host === new URL(url).host } catch { return false }
 }
 
 export function createApp(deps: AppDeps) {
@@ -50,35 +68,78 @@ export function createApp(deps: AppDeps) {
 
   app.post('/setup', async c => {
     if (!setupOpen(deps)) return c.notFound()
+    if (!sameOrigin(c.req.header('origin'), c.req.url)) return c.text('cross-origin post refused', 403)
 
     const body = await c.req.parseBody()
     const token = parseMagicLinkToken(String(body.link ?? ''))
     if (!token) {
       return c.html(setupPage({
-        error: 'That does not look like a magic link. Paste the whole link from the email, '
-          + 'the one starting with https://bingers.app/m?token=',
+        error: 'That does not look like a Bingers magic link. Paste the whole link from the email, '
+          + 'the one starting with https://bingers.app/m?token= — not a link your mail provider '
+          + 'rewrote to point at its own click tracker.',
       }), 400)
     }
+
+    // Everything below can reject the link, and a rejected link must leave the
+    // session exactly as it was rather than half-adopted.
+    const before = deps.auth.snapshot()
 
     const r = await redeemMagicLink(
       { auth: deps.auth, userAgent: deps.config.bingersUserAgent, fetchImpl: deps.fetchImpl },
       token,
     )
     if (!r.ok) {
+      deps.auth.restore(before)
       console.log(`[setup] redeem failed -> ${r.reason}`)
       return c.html(setupPage({
         error: `Bingers would not accept that link (${r.reason}). A link is single-use and short-lived — if you tapped it in the email, it is already spent. Request a fresh one and copy it instead.`,
       }), 502)
     }
 
-    // The session that halted writes is gone; the new one has not failed at
-    // anything yet, so the gate reopens and the outbox drains on its next tick.
-    if (deps.gate.halted) { deps.gate.clear(); console.log('[setup] session acquired, resuming writes') }
-    // Best-effort: fills in expiresAt so /health reports the new session's life
-    // immediately rather than null until the next daily heartbeat.
-    try { await deps.auth.heartbeat(deps.fetchImpl) } catch (e) {
+    // Verify BEFORE trusting. A cookie that cannot fetch its own session is not
+    // a working session, and reopening the write gate on it just 401s again on
+    // the next scrobble and re-halts with a second notification. beat() has
+    // always cleared the gate only after a good heartbeat; this is that rule.
+    let session: Awaited<ReturnType<typeof deps.auth.heartbeat>>
+    try {
+      session = await deps.auth.heartbeat(deps.fetchImpl)
+    } catch (e) {
+      deps.auth.restore(before)
       console.log(`[setup] heartbeat after setup failed -> ${(e as Error).message}`)
+      return c.html(setupPage({
+        error: `That link was accepted, but the session it returned does not work (${(e as Error).message}). Nothing was changed. Request a fresh link and try again.`,
+      }), 502)
     }
+
+    // Trust on first use: the first account this container ever syncs is the
+    // account it stays bound to. Being self-closing is not on its own what
+    // stops a LAN neighbour re-pointing the sync -- the page is legitimately
+    // open for the whole of first boot and every session death, and /health
+    // advertises exactly when. This is what makes that claim true afterwards.
+    const known = before.state.accountId
+    if (known && session.accountId && session.accountId !== known) {
+      deps.auth.restore(before)
+      console.log('[setup] refused a link for a different bingers account')
+      return c.html(setupPage({
+        error: 'That link is for a different Bingers account than the one this container already '
+          + 'syncs. Paste a link for the original account. (To move the sync to another account '
+          + 'on purpose, stop the container and delete the database under /data.)',
+      }), 403)
+    }
+
+    // The session works and is the right one, so writing may resume: the outbox
+    // drains on its next tick.
+    if (deps.gate.halted) { deps.gate.clear(); console.log('[setup] session acquired, resuming writes') }
+
+    // The boot pull returned immediately because there was no session, so the
+    // mirror has never synced and backfill stays suppressed until the next
+    // scheduled pull -- up to SYNC_PULL_INTERVAL_MIN after a setup that just
+    // succeeded. Episodes watched inside that window lose their backfill for
+    // good, since nothing revisits them once the mirror goes fresh.
+    try { await pullOnce(syncDeps(deps)) } catch (e) {
+      console.log(`[setup] first pull after setup failed -> ${(e as Error).message}`)
+    }
+
     console.log('[setup] session stored')
     return c.html(setupPage({ done: true }))
   })

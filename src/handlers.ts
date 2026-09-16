@@ -74,7 +74,7 @@ export function allLeavesSkipReason(
   return null
 }
 
-function syncDeps(d: AppDeps): SyncDeps {
+export function syncDeps(d: AppDeps): SyncDeps {
   return {
     auth: d.auth, store: d.store, userAgent: d.config.bingersUserAgent,
     dryRun: d.config.dryRun, watchDateToleranceSec: d.config.watchDateToleranceSec,

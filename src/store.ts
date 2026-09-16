@@ -2,7 +2,13 @@ import Database from 'better-sqlite3'
 
 export type TitleMapping = { source: string; extId: string; kind: string; titleId: string; title: string | null; year: number | null }
 export type EpisodeMapping = { titleId: string; season: number; number: number; episodeId: string; abs: number | null; title: string | null; aired: string | null; seasonHash: string }
-export type AuthState = { cookie: string; expiresAt: string | null; rotatedAt: string | null; checkedAt: string | null }
+export type AuthState = {
+  cookie: string; expiresAt: string | null; rotatedAt: string | null; checkedAt: string | null
+  // The Bingers account the session belongs to. /setup binds to the first one
+  // it sees and refuses a link for any other, so a container cannot be
+  // re-pointed at someone else's account by whoever reaches the port first.
+  accountId: string | null
+}
 export type FailureRow = { id: number; source: string; reason: string; payload: string; created_at: string }
 
 const SCHEMA = `
@@ -40,7 +46,7 @@ CREATE TABLE IF NOT EXISTS failures (
 
 CREATE TABLE IF NOT EXISTS auth_state (
   id INTEGER PRIMARY KEY CHECK (id = 1), cookie TEXT NOT NULL,
-  expires_at TEXT, rotated_at TEXT, checked_at TEXT);
+  expires_at TEXT, rotated_at TEXT, checked_at TEXT, account_id TEXT);
 `
 
 // Name of the cursor row that records the last SUCCESSFUL sync/pull. It lives
@@ -69,6 +75,8 @@ export function openStore(dbPath: string) {
   // by the live column list so this is safe to run on every boot.
   const outboxCols = (db.prepare('PRAGMA table_info(outbox)').all() as { name: string }[]).map(c => c.name)
   if (!outboxCols.includes('watched_at')) db.exec('ALTER TABLE outbox ADD COLUMN watched_at TEXT')
+  const authCols = (db.prepare('PRAGMA table_info(auth_state)').all() as { name: string }[]).map(c => c.name)
+  if (!authCols.includes('account_id')) db.exec('ALTER TABLE auth_state ADD COLUMN account_id TEXT')
 
   const now = () => new Date().toISOString()
 
@@ -169,16 +177,18 @@ export function openStore(dbPath: string) {
       return db.prepare('SELECT * FROM failures ORDER BY id DESC LIMIT ?').all(limit) as FailureRow[]
     },
     getAuthState(): AuthState | null {
-      const r = db.prepare('SELECT cookie, expires_at, rotated_at, checked_at FROM auth_state WHERE id=1').get() as
-        | { cookie: string; expires_at: string | null; rotated_at: string | null; checked_at: string | null }
+      const r = db.prepare('SELECT cookie, expires_at, rotated_at, checked_at, account_id FROM auth_state WHERE id=1').get() as
+        | { cookie: string; expires_at: string | null; rotated_at: string | null; checked_at: string | null; account_id: string | null }
         | undefined
-      return r ? { cookie: r.cookie, expiresAt: r.expires_at, rotatedAt: r.rotated_at, checkedAt: r.checked_at } : null
+      return r
+        ? { cookie: r.cookie, expiresAt: r.expires_at, rotatedAt: r.rotated_at, checkedAt: r.checked_at, accountId: r.account_id }
+        : null
     },
     putAuthState(s: AuthState) {
-      db.prepare(`INSERT INTO auth_state (id, cookie, expires_at, rotated_at, checked_at) VALUES (1,?,?,?,?)
+      db.prepare(`INSERT INTO auth_state (id, cookie, expires_at, rotated_at, checked_at, account_id) VALUES (1,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET cookie=excluded.cookie, expires_at=excluded.expires_at,
-          rotated_at=excluded.rotated_at, checked_at=excluded.checked_at`)
-        .run(s.cookie, s.expiresAt, s.rotatedAt, s.checkedAt)
+          rotated_at=excluded.rotated_at, checked_at=excluded.checked_at, account_id=excluded.account_id`)
+        .run(s.cookie, s.expiresAt, s.rotatedAt, s.checkedAt, s.accountId)
     },
     // `dated` carries the REAL watch time each entries op should end up with.
     // It is stored in its own column rather than inside fields_json so the op

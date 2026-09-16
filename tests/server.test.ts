@@ -235,4 +235,117 @@ describe('/setup', () => {
     expect(await (await setupApp({ cookie: 'TOK' }).app.request('/health')).json())
       .toMatchObject({ setupRequired: false })
   })
+
+  // The commonest way a session ends, and the one the write gate never saw: it
+  // simply ran out. The gate closes only on a 401 from a real WRITE, and under
+  // DRY_RUN -- the default -- no write ever reaches the network, so nothing
+  // could reopen this page at all.
+  it('reopens when the session has expired, with no 401 anywhere', async () => {
+    store.putAuthState({
+      cookie: 'STALE', expiresAt: new Date(Date.now() - 86_400_000).toISOString(),
+      rotatedAt: null, checkedAt: null, accountId: null,
+    })
+    const { app } = setupApp()
+    expect((await app.request('/setup')).status).toBe(200)
+    expect(await (await app.request('/health')).json()).toMatchObject({ setupRequired: true })
+  })
+
+  // A 401 on a READ (the scheduled pull, the daily heartbeat) says the session
+  // is dead just as loudly as one on a write, but it never halts the gate.
+  it('reopens after a 401 on a read, which never halts the write gate', async () => {
+    const { app, auth, gate } = setupApp({ cookie: 'STALE' })
+    expect((await app.request('/setup')).status).toBe(404)
+    auth.noteUnauthorized()
+    expect(gate.halted).toBe(false)
+    expect((await app.request('/setup')).status).toBe(200)
+  })
+
+  // A form POST is CORS-simple: no preflight, and the attacker never needs to
+  // read the reply. Any page the operator's browser loads could submit one.
+  it('refuses a cross-origin form post', async () => {
+    const { app, auth } = setupApp()
+    const res = await app.request('/setup', {
+      ...paste(LINK),
+      headers: { 'content-type': 'application/x-www-form-urlencoded', origin: 'https://evil.test' },
+    })
+    expect(res.status).toBe(403)
+    expect(auth.hasSession()).toBe(false)
+  })
+
+  // The gate used to reopen before anything checked the new cookie, so a
+  // session that failed its only health check resumed writing, 401'd on the
+  // next scrobble and re-halted with a second notification.
+  it('does not resume writing on a cookie whose own session lookup fails', async () => {
+    const gate = createGate()
+    gate.halt('bingers 401')
+    const fetchImpl = vi.fn(async (url: any) =>
+      String(url).includes('/auth/magic-link/verify') ? VERIFIED() : new Response('{}', { status: 401 }))
+    const { app, auth } = setupApp({ cookie: 'STALE', gate, fetchImpl })
+
+    const res = await app.request('/setup', paste(LINK))
+    expect(res.status).toBe(502)
+    expect(gate.halted).toBe(true)
+    // and nothing was half-adopted: the container is on the session it had
+    expect(auth.cookieHeader()).toBe('__Secure-better-auth.session_token=STALE')
+    expect((await app.request('/setup')).status).toBe(200)
+  })
+
+  // Being self-closing is not by itself what stops a LAN neighbour re-pointing
+  // the sync: the page is legitimately open for all of first boot and every
+  // session death, and /health says exactly when. The account binding is.
+  it('refuses a link for a different bingers account than the one it syncs', async () => {
+    store.putAuthState({ cookie: 'STALE', expiresAt: null, rotatedAt: null, checkedAt: null, accountId: 'mine' })
+    const gate = createGate()
+    gate.halt('bingers 401')
+    const fetchImpl = vi.fn(async (url: any) =>
+      String(url).includes('/auth/magic-link/verify')
+        ? VERIFIED()
+        : new Response(JSON.stringify({ session: { expiresAt: '2027-09-16T08:20:14.792Z' }, user: { id: 'theirs' } }), { status: 200 }))
+    const { app, auth } = setupApp({ gate, fetchImpl })
+
+    const res = await app.request('/setup', paste(LINK))
+    expect(res.status).toBe(403)
+    expect(auth.cookieHeader()).toBe('__Secure-better-auth.session_token=STALE')
+    expect(store.getAuthState()!.accountId).toBe('mine')
+    expect(gate.halted).toBe(true)
+  })
+
+  it('accepts a link for the account it is already bound to', async () => {
+    store.putAuthState({ cookie: 'STALE', expiresAt: null, rotatedAt: null, checkedAt: null, accountId: 'mine' })
+    const gate = createGate()
+    gate.halt('bingers 401')
+    const fetchImpl = vi.fn(async (url: any) =>
+      String(url).includes('/auth/magic-link/verify')
+        ? VERIFIED()
+        : new Response(JSON.stringify({ session: { expiresAt: '2027-09-16T08:20:14.792Z' }, user: { id: 'mine' } }), { status: 200 }))
+    const { app, auth } = setupApp({ gate, fetchImpl })
+
+    expect((await app.request('/setup', paste(LINK))).status).toBe(200)
+    expect(auth.cookieHeader()).toBe('__Secure-better-auth.session_token=FRESH')
+    expect(gate.halted).toBe(false)
+  })
+
+  // The boot pull returned instantly because there was no session, so the
+  // mirror had never synced. Without a pull here, backfill stays suppressed for
+  // up to SYNC_PULL_INTERVAL_MIN on a container that was just set up correctly
+  // -- and episodes watched in that window never get backfilled at all.
+  it('refreshes the mirror immediately, so backfill is not dead for 30 minutes', async () => {
+    const { app } = setupApp()
+    await app.request('/setup', paste(LINK))
+    expect(await (await app.request('/health')).json())
+      .toMatchObject({ mirrorFresh: true, backfillEnabled: true, setupRequired: false })
+  })
+
+  // A failed first pull is not a failed setup: the session is stored and the
+  // next scheduled pull picks it up.
+  it('still reports success when that first pull fails', async () => {
+    const fetchImpl = vi.fn(async (url: any) => {
+      if (String(url).includes('/auth/magic-link/verify')) return VERIFIED()
+      if (String(url).includes('/sync/pull')) return new Response('{}', { status: 500 })
+      return new Response(JSON.stringify({ session: { expiresAt: '2027-09-16T08:20:14.792Z' } }), { status: 200 })
+    })
+    const { app, auth } = setupApp({ fetchImpl })
+    expect((await app.request('/setup', paste(LINK))).status).toBe(200)
+    expect(auth.cookieHeader()).toBe('__Secure-better-auth.session_token=FRESH')
+  })
 })

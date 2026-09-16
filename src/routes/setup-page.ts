@@ -19,20 +19,17 @@ const SHELL = (title: string, body: string) => `<!DOCTYPE html>
   li { margin-bottom:10px }
   code { background:#000; border:1px solid var(--line); border-radius:4px;
          padding:1px 5px; font-size:13px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
-  .warn { color:var(--fg); background:#2a2320; border-left:3px solid #e0af68;
-          padding:10px 14px; border-radius:0 6px 6px 0; margin:0 0 20px; font-size:14px }
+  .note { border-left:3px solid currentColor; padding:10px 14px; border-radius:0 6px 6px 0;
+          margin:0 0 20px; font-size:14px }
+  .warn { color:#e0af68 }
+  .err { color:var(--bad) }
+  .ok { color:var(--good); font-weight:600; margin:0 0 8px }
   label { display:block; font-weight:600; margin-bottom:8px; font-size:14px }
   input { width:100%; padding:10px 12px; border-radius:6px; border:1px solid var(--line);
           background:#000; color:var(--fg); font-size:14px;
           font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
-  input:focus { outline:2px solid var(--accent); outline-offset:-1px; border-color:transparent }
   button { margin-top:14px; width:100%; padding:11px; border-radius:6px; border:0;
            background:var(--accent); color:#0d0d10; font-weight:650; font-size:15px; cursor:pointer }
-  button:hover { filter:brightness(1.08) }
-  .err { color:var(--bad); border-left:3px solid var(--bad); background:#2a1c20;
-         padding:10px 14px; border-radius:0 6px 6px 0; margin:0 0 20px; font-size:14px }
-  .ok { color:var(--good); font-size:15px; margin:0 0 8px; font-weight:600 }
-  .foot { color:var(--dim); font-size:13px; margin-top:20px; text-align:center }
   a { color:var(--accent) }
 </style></head><body><main>${body}</main></body></html>`
 
@@ -51,14 +48,15 @@ export function setupPage(opts: { error?: string; done?: boolean }): string {
         <p class="ok">✓ Session stored</p>
         <p style="margin:0;color:var(--dim)">It survives restarts — it lives in the database under
         <code>/data</code>, not in <code>.env</code>. Check <a href="/health">/health</a> for how long it lasts.
-        If it ever expires, this page reopens on its own.</p>
+        This page reopens on its own when the session expires or stops being accepted, and from then on
+        it only accepts links for this same Bingers account.</p>
       </div>`)
   }
 
   return SHELL('Set up bingers-sync', `
     <h1>Connect to Bingers</h1>
     <p class="sub">bingers-sync needs a session before it can mirror anything.</p>
-    ${opts.error ? `<p class="err">${esc(opts.error)}</p>` : ''}
+    ${opts.error ? `<p class="note err">${esc(opts.error)}</p>` : ''}
     <div class="card">
       <ol>
         <li>Open the Bingers app and sign out, then enter your email to request a magic link.</li>
@@ -66,7 +64,7 @@ export function setupPage(opts: { error?: string; done?: boolean }): string {
             <em>Copy Link</em> instead.</li>
         <li>Paste it below.</li>
       </ol>
-      <p class="warn"><strong>Tapping the link spends it.</strong> The token works exactly once, so if
+      <p class="note warn"><strong>Tapping the link spends it.</strong> The token works exactly once, so if
       the app opens it first there is nothing left for this page. Copy, don't tap.</p>
       <form method="post" action="/setup">
         <label for="link">Magic link</label>
@@ -75,6 +73,6 @@ export function setupPage(opts: { error?: string; done?: boolean }): string {
         <button type="submit">Connect</button>
       </form>
     </div>
-    <p class="foot">The link is exchanged for a session here, on your machine.
-    Nothing is sent anywhere except Bingers.</p>`)
+    <p style="color:var(--dim);font-size:13px;margin-top:20px;text-align:center">The link is exchanged
+    for a session here, on your machine. Nothing is sent anywhere except Bingers.</p>`)
 }

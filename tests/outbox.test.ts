@@ -37,6 +37,22 @@ describe('backoffMs', () => {
 })
 
 describe('submit', () => {
+  // The no-session guard was added to pullOnce and the heartbeat but not here,
+  // so an unconfigured container sent `Cookie: ...=` with an empty value, got a
+  // 401, and halted the gate + fired the notify webhook -- announcing itself as
+  // broken for the one reason that is not a fault. The work must queue instead.
+  it('queues without halting or notifying when there is no session yet', async () => {
+    const f = vi.fn(async () => new Response('{}', { status: 401 }))
+    const deps = { ...mk(f), auth: createAuth(store, '', 'UA'), notifyUrl: 'http://hook' }
+    const gate = createGate()
+    const r = await submit(deps, gate, [OP('1')])
+    expect(r).toBe('queued')
+    expect(gate.halted).toBe(false)
+    expect(store.outboxDepth()).toBe(1)
+    expect(f).not.toHaveBeenCalled()
+    expect(store.listFailures(10)).toHaveLength(0)
+  })
+
   it('sends when healthy and queues nothing', async () => {
     const r = await submit(mk(ok()), createGate(), [OP('1')])
     expect(r).toBe('sent')

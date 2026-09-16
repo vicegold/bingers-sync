@@ -132,6 +132,7 @@ describe('auth_state', () => {
       expiresAt: '2026-09-30T00:00:00Z',
       rotatedAt: '2026-09-16T00:00:00Z',
       checkedAt: '2026-09-16T12:00:00Z',
+      accountId: 'usr_1',
     }
     s.putAuthState(auth)
     const result = s.getAuthState()
@@ -142,18 +143,51 @@ describe('auth_state', () => {
     expect(s.getAuthState()).toBeNull()
   })
 
+  // SCHEMA uses CREATE TABLE IF NOT EXISTS, so account_id never appears on a
+  // database that already exists -- and every upgraded install has one, with a
+  // live session in it. Opening it must migrate in place, not throw and not
+  // drop the cookie the container is running on.
+  it('adds account_id to an auth_state table written by the previous release', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bingers-migrate-'))
+    const path = join(dir, 'old.db')
+    try {
+      const old = new Database(path)
+      old.exec(`CREATE TABLE auth_state (id INTEGER PRIMARY KEY CHECK (id = 1), cookie TEXT NOT NULL,
+        expires_at TEXT, rotated_at TEXT, checked_at TEXT);`)
+      old.prepare('INSERT INTO auth_state (id, cookie, expires_at) VALUES (1,?,?)')
+        .run('LIVE', '2027-01-01T00:00:00Z')
+      old.close()
+
+      const migrated = openStore(path)
+      expect(migrated.getAuthState()).toEqual({
+        cookie: 'LIVE', expiresAt: '2027-01-01T00:00:00Z',
+        rotatedAt: null, checkedAt: null, accountId: null,
+      })
+      // and the new column is writable, not just readable
+      migrated.putAuthState({
+        cookie: 'LIVE', expiresAt: '2027-01-01T00:00:00Z',
+        rotatedAt: null, checkedAt: null, accountId: 'u1',
+      })
+      expect(migrated.getAuthState()!.accountId).toBe('u1')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   it('upserts rather than throwing on a repeated auth state (singleton check)', () => {
     const auth1 = {
       cookie: 'old_session',
       expiresAt: null,
       rotatedAt: null,
       checkedAt: null,
+      accountId: null,
     }
     const auth2 = {
       cookie: 'new_session',
       expiresAt: '2026-09-30T00:00:00Z',
       rotatedAt: '2026-09-16T00:00:00Z',
       checkedAt: '2026-09-16T12:00:00Z',
+      accountId: 'usr_1',
     }
     s.putAuthState(auth1)
     s.putAuthState(auth2)

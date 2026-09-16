@@ -23,9 +23,18 @@ Mirrors Plex scrobbles and Pulsarr watchlist changes into Bingers.
    spends it before it reaches the container — and paste it into the page.
    The page trades it for a session and stores it under `/data`.
 
-   `/setup` is self-closing: it answers only while there is no working session,
-   and 404s the rest of the time, so a neighbour on your LAN cannot re-point the
-   sync at their own account. It reopens by itself if the session ever dies.
+   `/setup` is self-closing: it answers only while there is no working session
+   and 404s the rest of the time, and it reopens by itself when the session
+   expires or starts being rejected. `setupRequired` in `/health` says which it
+   currently is.
+
+   It is not, however, closed during first boot — it cannot be, since that is
+   when you use it — so the port is worth keeping off any untrusted network.
+   What protects it afterwards is that the first session it stores fixes the
+   Bingers account this container syncs: a link for any other account is
+   refused, so a neighbour cannot re-point the sync at their own even while the
+   page is open. To move the sync to a different account on purpose, stop the
+   container and delete the database under `/data`.
 5. Point Plex and Pulsarr at the service. Use the host's **IP**, not a hostname:
 
    | Webhook | URL |
@@ -64,6 +73,16 @@ Verify the log looks right, then set `DRY_RUN=false` and restart.
 - The session cannot be renewed programmatically: requesting a magic link is
   behind a Cloudflare Turnstile check that only the app can pass, so the
   container can redeem a link but never ask for one. If `sessionDaysRemaining`
-  starts falling toward zero, or a 401 halts writes, open `/setup` again — it
-  reopens on its own in both cases — and paste a fresh link. No restart, and
-  nothing to edit in `.env`.
+  starts falling toward zero, if a 401 halts writes, or if the session simply
+  runs out, open `/setup` again and paste a fresh link — it reopens on its own
+  in all three cases. No restart, and nothing to edit in `.env`.
+
+  `/setup` verifies the session before it trusts it: a link that is rejected, or
+  that returns a session which cannot then look itself up, leaves the container
+  on whatever it had rather than on a half-adopted one. So a red page there
+  means nothing changed, and a green one means the new session actually works.
+
+- Until a session exists, nothing is lost and nothing cries wolf: writes queue in
+  the outbox instead of being sent with an empty cookie, so an unconfigured
+  container does not report itself as a broken one. They drain on the next flush
+  after `/setup` succeeds.

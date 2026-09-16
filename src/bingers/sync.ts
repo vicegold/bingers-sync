@@ -11,7 +11,25 @@ export type SyncDeps = {
   notifyUrl?: string | null
 }
 
+/**
+ * Thrown instead of sending an authenticated request with an empty cookie.
+ * Doing so would 401, and a 401 on the write path halts the gate, records a
+ * failure and fires the notify webhook -- so an unconfigured container would
+ * announce itself as a broken one. Deliberately carries no "401" in its
+ * message: isUnauthorized() in outbox.ts keys off that, and this is the one
+ * authentication failure that must NOT halt the gate. Callers that already
+ * queue on a throw (submit, flushOutbox) therefore do the right thing with no
+ * change of their own.
+ *
+ * It lives at the choke point every authenticated call passes through, so a
+ * call site added later cannot forget the guard the way the write path did.
+ */
+export class NoSessionError extends Error {
+  constructor() { super('no bingers session yet — open /setup') }
+}
+
 function headers(deps: SyncDeps, json = false): Record<string, string> {
+  if (!deps.auth.hasSession()) throw new NoSessionError()
   const h: Record<string, string> = {
     Cookie: deps.auth.cookieHeader(), 'User-Agent': deps.userAgent, Accept: 'application/json',
   }
@@ -23,6 +41,11 @@ async function call(deps: SyncDeps, url: string, init?: RequestInit): Promise<Re
   const fetchImpl = deps.fetchImpl ?? fetch
   const res = await fetchImpl(url, init)
   deps.auth.absorb(res)
+  // A 401 from any authenticated call is the session telling us it is spent.
+  // Recorded on auth, not just the gate, because a 401 on a READ (pull) never
+  // halts writes -- yet it is the commonest way a session dies, and /setup has
+  // to reopen for it.
+  if (res.status === 401) deps.auth.noteUnauthorized()
   return res
 }
 

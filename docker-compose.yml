@@ -3,7 +3,7 @@ services:
         image: ghcr.io/vicegold/bingers-sync:latest
         restart: unless-stopped
         environment:
-            # - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE} # optional seed; the session normally comes from /setup and lives in the db
+            - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE:-} # optional seed, normally empty; the session comes from /setup and lives in the db
             - PLEX_URL=${PLEX_URL} # plex base url, use the LAN ip not a hostname
             - PLEX_TOKEN=${PLEX_TOKEN} # plex api token
             - ALLOWED_USER=${ALLOWED_USER} # whose activity to sync, everyone else is ignored
@@ -28,7 +28,7 @@ services:
         build: .
         restart: unless-stopped
         environment:
-            # - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE} # see the note on the published service above
+            - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE:-}
             - PLEX_URL=${PLEX_URL}
             - PLEX_TOKEN=${PLEX_TOKEN}
             - ALLOWED_USER=${ALLOWED_USER}
