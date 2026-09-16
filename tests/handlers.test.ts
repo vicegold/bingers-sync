@@ -5,6 +5,7 @@ import { openStore, type Store } from '../src/store.js'
 import { createAuth } from '../src/bingers/auth.js'
 import { loadConfig } from '../src/config.js'
 import { handlePlex, handlePulsarr } from '../src/handlers.js'
+import { createGate } from '../src/outbox.js'
 
 const fx = (n: string) => JSON.parse(readFileSync(`tests/fixtures/${n}.json`, 'utf8'))
 let store: Store
@@ -50,7 +51,7 @@ const ROUTES: [RegExp, unknown][] = [
   [/sync\/push/, { results: [], rows: {} }],
 ]
 
-const deps = (f: any) => ({ config: CONFIG, store, auth: createAuth(store, 'TOK', 'UA'), fetchImpl: f as typeof fetch, newId })
+const deps = (f: any) => ({ config: CONFIG, store, auth: createAuth(store, 'TOK', 'UA'), gate: createGate(), fetchImpl: f as typeof fetch, newId })
 
 describe('handlePlex', () => {
   it('ignores a scrobble from another user without writing', async () => {

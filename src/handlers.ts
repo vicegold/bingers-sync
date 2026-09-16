@@ -6,11 +6,12 @@ import type { PlexScrobble, PulsarrEvent } from './routes/parse.js'
 import { resolveTitle, resolveEpisode, type ExternalIds } from './resolve.js'
 import { fetchShowIds, fetchAllLeaves, parseGuids } from './plex/client.js'
 import { planScrobble, planWatchlist } from './plan.js'
-import { pushOps, applyDates, type SyncDeps } from './bingers/sync.js'
+import { applyDates, type SyncDeps } from './bingers/sync.js'
+import { submit, type Gate } from './outbox.js'
 import { notify } from './notify.js'
 
 export type AppDeps = {
-  config: Config; store: Store; auth: Auth
+  config: Config; store: Store; auth: Auth; gate: Gate
   fetchImpl?: typeof fetch; newId?: () => string
 }
 export type HandlerResult = { status: 'ok' | 'ignored' | 'failed'; reason?: string }
@@ -99,8 +100,8 @@ export async function handlePlex(d: AppDeps, s: PlexScrobble): Promise<HandlerRe
     isFollowed: isFollowed(d.store, t.titleId), backfill, newId,
   })
 
-  await pushOps(syncDeps(d), plan.ops)
-  await applyDates(syncDeps(d), plan.dated)
+  const outcome = await submit(syncDeps(d), d.gate, plan.ops)
+  if (outcome === 'sent') await applyDates(syncDeps(d), plan.dated)
   return { status: 'ok' }
 }
 
@@ -113,6 +114,6 @@ export async function handlePulsarr(d: AppDeps, e: PulsarrEvent): Promise<Handle
   if ('failure' in t) return fail(d, 'pulsarr', t.failure, e)
 
   const plan = planWatchlist({ titleId: t.titleId, kind: e.kind, action: e.action, newId })
-  await pushOps(syncDeps(d), plan.ops)
+  await submit(syncDeps(d), d.gate, plan.ops)
   return { status: 'ok' }
 }

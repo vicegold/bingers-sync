@@ -120,6 +120,38 @@ export function openStore(dbPath: string) {
           rotated_at=excluded.rotated_at, checked_at=excluded.checked_at`)
         .run(s.cookie, s.expiresAt, s.rotatedAt, s.checkedAt)
     },
+    enqueueOps(ops: { opId: string; table: string; pk: unknown; [k: string]: unknown }[]) {
+      const st = db.prepare(`INSERT INTO outbox (op_id, batch_id, table_name, pk_json, fields_json, attempts, next_try_at, status, created_at)
+        VALUES (?,?,?,?,?,0,?, 'pending', ?) ON CONFLICT(op_id) DO NOTHING`)
+      const t = now()
+      db.transaction(() => {
+        for (const o of ops) {
+          const { opId, table, pk, ...rest } = o as any
+          st.run(opId, (rest.fields?.batchId ?? null), table, JSON.stringify(pk), JSON.stringify(rest), t, t)
+        }
+      })()
+    },
+    dueOps(nowIso: string, limit = 50) {
+      const rows = db.prepare(`SELECT op_id, table_name, pk_json, fields_json FROM outbox
+        WHERE status='pending' AND (next_try_at IS NULL OR next_try_at <= ?) ORDER BY created_at LIMIT ?`)
+        .all(nowIso, limit) as { op_id: string; table_name: string; pk_json: string; fields_json: string }[]
+      return rows.map(r => ({ opId: r.op_id, table: r.table_name, pk: JSON.parse(r.pk_json), ...JSON.parse(r.fields_json) })) as any[]
+    },
+    markApplied(opIds: string[]) {
+      const st = db.prepare("UPDATE outbox SET status='applied' WHERE op_id=?")
+      db.transaction(() => { for (const id of opIds) st.run(id) })()
+    },
+    reschedule(opId: string, nextTryAt: string) {
+      db.prepare('UPDATE outbox SET attempts = attempts + 1, next_try_at = ? WHERE op_id = ?').run(nextTryAt, opId)
+    },
+    attemptsFor(opId: string): number {
+      const r = db.prepare('SELECT attempts FROM outbox WHERE op_id=?').get(opId) as { attempts: number } | undefined
+      return r?.attempts ?? 0
+    },
+    outboxDepth(): number {
+      const r = db.prepare("SELECT COUNT(*) AS n FROM outbox WHERE status='pending'").get() as { n: number }
+      return r.n
+    },
     close() { db.close() },
   }
 }
