@@ -43,6 +43,17 @@ describe('createAuth', () => {
     expect((f as any).mock.calls[0][0]).toContain('/auth/get-session?disableCookieCache=true')
   })
 
+  it('absorbs a rotated session_token even when the heartbeat response is not ok', async () => {
+    const a = createAuth(store, 'TOK', 'UA')
+    const f = vi.fn(async () => new Response('{}', {
+      status: 401,
+      headers: { 'set-cookie': '__Secure-better-auth.session_token=ROTATED_ON_FAIL; Max-Age=31536000; Path=/; Secure' },
+    }))
+    await expect(a.heartbeat(f as any)).rejects.toThrow(/401/)
+    expect(a.cookieHeader()).toBe('__Secure-better-auth.session_token=ROTATED_ON_FAIL')
+    expect(store.getAuthState()!.cookie).toBe('ROTATED_ON_FAIL')
+  })
+
   it('reports a sliding session when expiresAt moves forward', async () => {
     const a = createAuth(store, 'TOK', 'UA')
     await a.heartbeat(vi.fn(async () => new Response(JSON.stringify(SESSION), { status: 200 })) as any)

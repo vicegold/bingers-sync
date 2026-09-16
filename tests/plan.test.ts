@@ -30,9 +30,19 @@ describe('planScrobble', () => {
     expect(p.ops[1]!.table).toBe('entries')
   })
 
-  it('never sends timestamps in push fields', () => {
+  it('never sends timestamps in push fields (not-followed plan)', () => {
     counter = 0
     const p = planScrobble({ ...base, isFollowed: false })
+    for (const op of p.ops) {
+      const f = JSON.stringify('fields' in op ? op.fields : {})
+      expect(f).not.toContain('WatchedAt')
+      expect(f).not.toContain('followedAt')
+    }
+  })
+
+  it('never sends timestamps in push fields (followed plan)', () => {
+    counter = 0
+    const p = planScrobble(base)
     for (const op of p.ops) {
       const f = JSON.stringify('fields' in op ? op.fields : {})
       expect(f).not.toContain('WatchedAt')
@@ -72,6 +82,22 @@ describe('planScrobble', () => {
     expect(p.dated).toEqual([
       { entityKind: 'episode', entityId: 'E3', watchedAt: '2026-09-16T10:00:00.000Z' },
       { entityKind: 'episode', entityId: 'E1', watchedAt: '2026-09-02T20:00:00.000Z' },
+    ])
+  })
+
+  it('orders dated[] as primary entry then backfill entries in input order, for two or more backfill entries', () => {
+    counter = 0
+    const p = planScrobble({
+      ...base,
+      backfill: [
+        { episodeId: 'E1', plays: 1, watchedAt: '2026-09-02T20:00:00.000Z' },
+        { episodeId: 'E2', plays: 3, watchedAt: '2026-09-03T20:00:00.000Z' },
+      ],
+    })
+    expect(p.dated).toEqual([
+      { entityKind: 'episode', entityId: 'E3', watchedAt: '2026-09-16T10:00:00.000Z' },
+      { entityKind: 'episode', entityId: 'E1', watchedAt: '2026-09-02T20:00:00.000Z' },
+      { entityKind: 'episode', entityId: 'E2', watchedAt: '2026-09-03T20:00:00.000Z' },
     ])
   })
 

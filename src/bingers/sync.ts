@@ -27,11 +27,14 @@ async function call(deps: SyncDeps, url: string, init?: RequestInit): Promise<Re
 }
 
 export async function pushOps(deps: SyncDeps, ops: Op[]) {
-  if (ops.length === 0) return { applied: 0, appliedIds: [] as string[], rows: {} }
+  // dryRun is checked before the empty-ops shortcut so callers that switch on
+  // `'dryRun' in res` see one consistent shape for every call made under
+  // DRY_RUN, regardless of whether there happened to be anything to send.
   if (deps.dryRun) {
-    console.log('[DRY_RUN] would POST /sync/push', JSON.stringify({ ops }, null, 2))
+    if (ops.length) console.log('[DRY_RUN] would POST /sync/push', JSON.stringify({ ops }, null, 2))
     return { dryRun: true as const }
   }
+  if (ops.length === 0) return { applied: 0, appliedIds: [] as string[], rows: {} }
   const body = JSON.stringify({ clientBatchId: randomUUID(), ops })
   const res = await call(deps, `${API}/sync/push`, { method: 'POST', headers: headers(deps, true), body })
   if (!res.ok) throw new Error(`sync/push -> ${res.status}`)

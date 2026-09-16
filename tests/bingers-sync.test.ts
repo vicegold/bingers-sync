@@ -20,6 +20,12 @@ describe('pushOps', () => {
     expect(f).not.toHaveBeenCalled()
   })
 
+  it('reports the same {dryRun:true} shape in dry run even with no ops to send', async () => {
+    const f = vi.fn()
+    expect(await pushOps(mk(true, f), [])).toEqual({ dryRun: true })
+    expect(f).not.toHaveBeenCalled()
+  })
+
   it('posts one batch with a clientBatchId and the session cookie', async () => {
     const f = vi.fn(async () => new Response(JSON.stringify({ results: [{ opId: 'o1', status: 'applied' }], rows: {} }), { status: 200 }))
     await pushOps(mk(false, f), [OP])
@@ -118,6 +124,20 @@ describe('applyDates', () => {
     const failures = deps.store.listFailures()
     expect(failures.length).toBe(1)
     expect(failures[0].source).toBe('applyDates')
+  })
+
+  it('records a failure when a non-401 PATCH failure leaves a date silently uncorrected', async () => {
+    const f = vi.fn(async (url: string) => {
+      if (url.includes('/me/watches?')) return new Response(JSON.stringify({ watches: [{ id: 'w1', watchedAt: '2026-01-01T00:00:00.000Z' }] }), { status: 200 })
+      return new Response('{}', { status: 500 })
+    })
+    const deps = mk(false, f)
+    const n = await applyDates(deps, [{ entityKind: 'episode', entityId: 'E3', watchedAt: '2026-09-11T10:40:47.414Z' }])
+    expect(n).toBe(0)
+    const failures = deps.store.listFailures()
+    expect(failures.length).toBe(1)
+    expect(failures[0].source).toBe('applyDates')
+    expect(failures[0].reason).toMatch(/PATCH \/me\/watches\/w1 -> 500/)
   })
 })
 
