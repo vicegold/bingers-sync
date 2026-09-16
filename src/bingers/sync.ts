@@ -45,19 +45,31 @@ export async function applyDates(deps: SyncDeps, dated: DatedWrite[]): Promise<n
   }
   let patched = 0
   for (const d of dated) {
-    const url = `${API}/me/watches?entityKind=${d.entityKind}&entityId=${d.entityId}`
+    const url = `${API}/me/watches?entityKind=${d.entityKind}&entityId=${encodeURIComponent(d.entityId)}`
     const res = await call(deps, url, { headers: headers(deps) })
-    if (!res.ok) continue
+    if (res.status === 401) throw new Error(`me/watches -> 401`)
+    if (!res.ok) {
+      deps.store.recordFailure('applyDates', `GET /me/watches -> ${res.status}`, d)
+      continue
+    }
     const { watches = [] } = (await res.json()) as { watches?: { id: string; watchedAt: string }[] }
-    const target = watches[watches.length - 1]
-    if (!target) continue
+    if (!watches.length) continue
+    // Select by VALUE (greatest watchedAt), not by array position — response
+    // ordering from the server is unverified and a rewatch has multiple rows.
+    const target = watches.reduce((a, b) => (Date.parse(b.watchedAt) > Date.parse(a.watchedAt) ? b : a))
     const drift = Math.abs(Date.parse(target.watchedAt) - Date.parse(d.watchedAt)) / 1000
+    if (!Number.isFinite(drift)) continue
     if (drift <= deps.watchDateToleranceSec) continue
-    const p = await call(deps, `${API}/me/watches/${target.id}`, {
+    const p = await call(deps, `${API}/me/watches/${encodeURIComponent(target.id)}`, {
       method: 'PATCH', headers: headers(deps, true),
       body: JSON.stringify({ watchedAt: d.watchedAt, entityKind: d.entityKind, entityId: d.entityId }),
     })
-    if (p.ok) patched++
+    if (p.status === 401) throw new Error(`me/watches PATCH -> 401`)
+    if (p.ok) {
+      patched++
+    } else {
+      deps.store.recordFailure('applyDates', `PATCH /me/watches/${target.id} -> ${p.status}`, d)
+    }
   }
   return patched
 }
@@ -81,7 +93,12 @@ export async function pullOnce(deps: SyncDeps): Promise<void> {
   if (Array.isArray(b.entries) && b.entries.length) {
     deps.store.putSyncRows('entries', b.entries.map((r: any) => ({ pk: `${r.entityKind}:${r.entityId}`, row: r })))
   }
+  // Only advance cursors for streams we actually persisted rows for above.
+  // Sending a cursor for a stream we don't yet store (catalog/prefs/settings)
+  // is fine, but persisting its returned cursor would permanently skip any
+  // delta the server sends for it before we implement storage.
+  const PERSISTED = new Set(['follows', 'entries'])
   for (const [k, v] of Object.entries(b.cursors ?? {})) {
-    if (typeof v === 'string') deps.store.setCursor(k, v)
+    if (PERSISTED.has(k) && typeof v === 'string') deps.store.setCursor(k, v)
   }
 }

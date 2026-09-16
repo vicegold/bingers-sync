@@ -69,6 +69,56 @@ describe('applyDates', () => {
     expect(await applyDates(mk(true, f), [{ entityKind: 'episode', entityId: 'E3', watchedAt: '2026-01-01T00:00:00.000Z' }])).toBe(0)
     expect(f).not.toHaveBeenCalled()
   })
+
+  it('selects the newest watch by value, not by array position, for a rewatch with multiple records', async () => {
+    // Deliberately non-monotonic order: the middle element is the newest.
+    const watches = [
+      { id: 'w-old', watchedAt: '2026-01-01T00:00:00.000Z' },
+      { id: 'w-newest', watchedAt: '2026-09-16T10:00:00.000Z' },
+      { id: 'w-middle', watchedAt: '2026-05-01T00:00:00.000Z' },
+    ]
+    const f = vi.fn(async (url: string) => {
+      if (url.includes('/me/watches?')) return new Response(JSON.stringify({ watches }), { status: 200 })
+      return new Response(JSON.stringify({ entry: {} }), { status: 200 })
+    })
+    const n = await applyDates(mk(false, f), [{ entityKind: 'episode', entityId: 'E3', watchedAt: '2026-09-11T10:40:47.414Z' }])
+    expect(n).toBe(1)
+    const patch = (f as any).mock.calls.find((c: any[]) => c[1]?.method === 'PATCH')
+    expect(patch[0]).toBe('https://api.bingers.app/me/watches/w-newest')
+  })
+
+  it('skips the patch (does not fail open) when a timestamp is unparseable', async () => {
+    const f = vi.fn(async (url: string) => {
+      if (url.includes('/me/watches?')) return new Response(JSON.stringify({ watches: [{ id: 'w1', watchedAt: 'not-a-date' }] }), { status: 200 })
+      return new Response(JSON.stringify({ entry: {} }), { status: 200 })
+    })
+    const n = await applyDates(mk(false, f), [{ entityKind: 'episode', entityId: 'E3', watchedAt: '2026-09-11T10:40:47.414Z' }])
+    expect(n).toBe(0)
+    expect((f as any).mock.calls.every((c: any[]) => !String(c[1]?.method).includes('PATCH'))).toBe(true)
+  })
+
+  it('throws (does not swallow) a 401 from the GET lookup', async () => {
+    const f = vi.fn(async () => new Response('{}', { status: 401 }))
+    await expect(applyDates(mk(false, f), [{ entityKind: 'episode', entityId: 'E3', watchedAt: '2026-09-11T10:40:47.414Z' }])).rejects.toThrow(/401/)
+  })
+
+  it('throws (does not swallow) a 401 from the PATCH', async () => {
+    const f = vi.fn(async (url: string) => {
+      if (url.includes('/me/watches?')) return new Response(JSON.stringify({ watches: [{ id: 'w1', watchedAt: '2026-01-01T00:00:00.000Z' }] }), { status: 200 })
+      return new Response('{}', { status: 401 })
+    })
+    await expect(applyDates(mk(false, f), [{ entityKind: 'episode', entityId: 'E3', watchedAt: '2026-09-11T10:40:47.414Z' }])).rejects.toThrow(/401/)
+  })
+
+  it('records a failure when a non-401 GET failure leaves a date silently uncorrected', async () => {
+    const f = vi.fn(async () => new Response('{}', { status: 500 }))
+    const deps = mk(false, f)
+    const n = await applyDates(deps, [{ entityKind: 'episode', entityId: 'E3', watchedAt: '2026-09-11T10:40:47.414Z' }])
+    expect(n).toBe(0)
+    const failures = deps.store.listFailures()
+    expect(failures.length).toBe(1)
+    expect(failures[0].source).toBe('applyDates')
+  })
 })
 
 describe('pullOnce', () => {
@@ -90,5 +140,13 @@ describe('pullOnce', () => {
     const f = vi.fn(async () => new Response(JSON.stringify({ cursors: {} }), { status: 200 }))
     await pullOnce(mk(false, f))
     expect((f as any).mock.calls[0][0]).toContain('follows=CURSOR1')
+  })
+
+  it('does not advance a cursor for a stream it never persists rows for', async () => {
+    const body = { cursors: { catalog: 'SHOULD-NOT-STICK', follows: '2026-09-16T10:00:00.000Z' } }
+    const f = vi.fn(async () => new Response(JSON.stringify(body), { status: 200 }))
+    await pullOnce(mk(false, f))
+    expect(store.getCursor('catalog')).toBeNull()
+    expect(store.getCursor('follows')).toBe('2026-09-16T10:00:00.000Z')
   })
 })
