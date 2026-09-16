@@ -202,11 +202,19 @@ to `2026-09-11T10:40:47.414Z`; the response confirms both `firstWatchedAt` and
 back the watch record to get its `id`, then PATCH it. Cost is two extra requests
 per episode beyond the push.
 
-Not yet probed, and worth one attempt during implementation: whether
-`POST /me/watches` accepts `{ entityKind, entityId, watchedAt }` directly. If it
-does, a dated watch becomes a single request and the push/read/patch dance is
-unnecessary. `DELETE /me/watches/{id}` presumably exists too, for correcting a
-mistaken scrobble.
+Both shortcuts were probed and neither exists:
+
+- `POST /me/watches` → **404**. There is no one-step dated write; a watch record
+  can only be created by `sync/push` and then corrected.
+- `GET /me/watches?batchId=…` → **400 Invalid request body**. The endpoint accepts
+  only `entityKind` + `entityId`, so watch records cannot be read back in bulk,
+  not even for a batch the client itself grouped.
+
+So a dated write costs **3 requests** (push, read back, patch) and a backfill of N
+episodes costs **1 + 2N**. That is the floor, not a first draft. It is acceptable
+because backfill is a one-time cost per show and the steady state is different: a
+live scrobble lands inside `WATCH_DATE_TOLERANCE_SEC` of the server stamp, skips
+the correction entirely, and costs **1 request**.
 
 Row shapes observed in `sync/pull`:
 
@@ -251,8 +259,8 @@ action. Out-of-band delivery to the app is APNs push via Expo, registered with
 | Unfollow shape (op-level `deleted: true`) | **verified** — observed in capture 5 |
 | `stopped` / `forLater` / `watchlistHidden` ops | **verified** — observed in capture 5 |
 | Batched entries ops sharing a `batchId` | **verified** — observed in capture 4 |
-| `POST /me/watches` for one-step dated writes | **untested** — probe once |
-| `GET /me/watches?batchId=` for bulk read-back | **untested** — probe once |
+| `POST /me/watches` does not exist | **verified** — 404 |
+| `/me/watches` accepts no filter but `entityKind`+`entityId` | **verified** — `?batchId=` → 400 |
 | Session `expiresAt` slides forward on use | **assumed** — see Auth |
 
 The remaining assumed write shapes are why the service ships with `DRY_RUN=true`.
