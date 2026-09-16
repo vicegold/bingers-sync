@@ -214,7 +214,7 @@ action. Out-of-band delivery to the app is APNs push via Expo, registered with
 | No websocket/SSE channel exists | **verified** — absent from both captures |
 | `GET`/`PATCH /me/watches` backdating flow | **verified** — observed in capture 3 |
 | `entityKind: "movie"` exists in entries | **verified** — seen in an entries cursor |
-| Movie `entityId` = titleId | **assumed** |
+| Movie `entityId` = titleId | **verified** — a captured movie entityId resolves in the catalog as `kind: movie` |
 | Unfollow shape (likely `fields: { deleted: true }`) | **assumed** |
 | Batched entries ops sharing a `batchId` | **verified** — observed in capture 4 |
 | `POST /me/watches` for one-step dated writes | **untested** — probe once |
@@ -586,10 +586,42 @@ Going through the Plex watchlist rather than calling Sonarr directly keeps
 quality profile, root folder and season monitoring in Pulsarr, where they already
 live, instead of duplicating them here.
 
-The exact Plex Discover endpoint for adding to a watchlist is **not yet
-verified** — it needs a Discover `ratingKey`, which is not the local library
-`ratingKey`, so a lookup by GUID is required first. This must be confirmed
-against the live Plex API during implementation before the path is enabled.
+### Plex Discover endpoints
+
+```
+PUT https://discover.provider.plex.tv/actions/addToWatchlist?ratingKey={key}
+PUT https://discover.provider.plex.tv/actions/removeFromWatchlist?ratingKey={key}
+      key = guid.rsplit('/', 1)[-1]        # plex://show/65df7412… → 65df7412…
+GET https://discover.provider.plex.tv/library/search?query=&limit=&searchTypes=&includeMetadata=1
+```
+
+Endpoints taken from python-plexapi's `MyPlexAccount`, as used in production by
+PlexTraktSync. To be confirmed against the live account before the path is
+enabled.
+
+### The Discover matching constraint
+
+**Plex Discover offers no lookup by external ID, and its title search is
+unreliable.** PlexTraktSync states this outright in
+`sync/WatchListPlugin.py` — *"Plex Online search is inaccurate, and it doesn't
+offer search by id"* — and cites a real mismatch where one Trakt ID resolved to
+an unrelated film.
+
+This is the one place the system cannot match the exactness of the forward path,
+where Bingers' `external_ids` make intersection trivial. The mitigation keeps the
+guarantee but concedes coverage:
+
+1. `searchDiscover(title)` for the Bingers title
+2. read each candidate's `Guid[]` (requires `includeMetadata=1`)
+3. write **only** on a tmdb/tvdb/imdb intersection with the Bingers IDs
+4. no intersection → `failures` row + notification, never a guess
+
+So a Bingers follow that Discover cannot surface is reported rather than
+mismatched. Expect a non-zero rate of these; they are added by hand.
+
+Note the asymmetry: a Plex *scrobble* needs none of this, because the webhook
+already carries `grandparentGuid: plex://show/{id}`, whose last segment is the
+Discover ratingKey.
 
 ### Loop prevention
 
