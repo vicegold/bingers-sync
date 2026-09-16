@@ -26,7 +26,7 @@ async function call(deps: SyncDeps, url: string, init?: RequestInit): Promise<Re
 }
 
 export async function pushOps(deps: SyncDeps, ops: Op[]) {
-  if (ops.length === 0) return { applied: 0, rows: {} }
+  if (ops.length === 0) return { applied: 0, appliedIds: [] as string[], rows: {} }
   if (deps.dryRun) {
     console.log('[DRY_RUN] would POST /sync/push', JSON.stringify({ ops }, null, 2))
     return { dryRun: true as const }
@@ -35,7 +35,8 @@ export async function pushOps(deps: SyncDeps, ops: Op[]) {
   const res = await call(deps, `${API}/sync/push`, { method: 'POST', headers: headers(deps, true), body })
   if (!res.ok) throw new Error(`sync/push -> ${res.status}`)
   const j = (await res.json()) as { results: { opId: string; status: string }[]; rows: unknown }
-  return { applied: j.results.filter(r => r.status === 'applied').length, rows: j.rows }
+  const appliedIds = j.results.filter(r => r.status === 'applied').map(r => r.opId)
+  return { applied: appliedIds.length, appliedIds, rows: j.rows }
 }
 
 export async function applyDates(deps: SyncDeps, dated: DatedWrite[]): Promise<number> {

@@ -16,7 +16,15 @@ const mk = (f: any) => ({
   auth: createAuth(store, 'TOK', 'UA'), store, userAgent: 'UA',
   dryRun: false, watchDateToleranceSec: 120, fetchImpl: f as typeof fetch,
 })
-const ok = () => vi.fn(async () => new Response(JSON.stringify({ results: [], rows: {} }), { status: 200 }))
+// Body-aware: reports every op in the request as server-applied, so tests
+// that assert a full drain stay correct under the strict appliedIds-only
+// bookkeeping in flushOutbox (a partial-rejection response is stubbed
+// explicitly where that behavior is under test).
+const ok = () => vi.fn(async (_url: string, init?: any) => {
+  const ops = init?.body ? JSON.parse(init.body).ops : []
+  const results = ops.map((o: any) => ({ opId: o.opId, status: 'applied' }))
+  return new Response(JSON.stringify({ results, rows: {} }), { status: 200 })
+})
 const boom = (status: number) => vi.fn(async () => new Response('{}', { status }))
 
 describe('backoffMs', () => {
@@ -80,5 +88,28 @@ describe('flushOutbox', () => {
     const n = await flushOutbox(mk(boom(503)), createGate())
     expect(n).toBe(0)
     expect(store.outboxDepth()).toBe(1)
+  })
+
+  it('marks only server-confirmed ops applied and reschedules a rejected op inside an otherwise-200 batch, rather than losing it', async () => {
+    await submit(mk(boom(500)), createGate(), [OP('1'), OP('2')])
+    expect(store.outboxDepth()).toBe(2)
+    const partial = vi.fn(async () => new Response(JSON.stringify({
+      results: [{ opId: '1', status: 'applied' }, { opId: '2', status: 'rejected' }],
+      rows: {},
+    }), { status: 200 }))
+    const n = await flushOutbox(mk(partial), createGate())
+    expect(n).toBe(1)
+    expect(store.outboxDepth()).toBe(1)
+  })
+})
+
+describe('enqueueOps / dueOps round-trip', () => {
+  it('preserves the delete-op shape: no spurious fields key is added', () => {
+    const del = { opId: 'd1', table: 'follows' as const, pk: { titleId: 'T1' }, deleted: true as const }
+    store.enqueueOps([del] as any)
+    const [rt] = store.dueOps(new Date().toISOString())
+    expect(rt).toEqual(del)
+    expect(rt.deleted).toBe(true)
+    expect('fields' in rt).toBe(false)
   })
 })

@@ -34,9 +34,16 @@ export async function flushOutbox(deps: SyncDeps, gate: Gate): Promise<number> {
   const due = deps.store.dueOps(new Date().toISOString())
   if (due.length === 0) return 0
   try {
-    await pushOps(deps, due as Op[])
-    deps.store.markApplied(due.map(o => o.opId))
-    return due.length
+    const result = await pushOps(deps, due as Op[])
+    const appliedIds = new Set('appliedIds' in result ? result.appliedIds : due.map(o => o.opId))
+    const applied = due.filter(o => appliedIds.has(o.opId))
+    const rejected = due.filter(o => !appliedIds.has(o.opId))
+    if (applied.length) deps.store.markApplied(applied.map(o => o.opId))
+    for (const o of rejected) {
+      const next = new Date(Date.now() + backoffMs(deps.store.attemptsFor(o.opId))).toISOString()
+      deps.store.reschedule(o.opId, next)
+    }
+    return applied.length
   } catch (e) {
     const msg = (e as Error).message
     if (msg.includes('401')) gate.halt(msg)
