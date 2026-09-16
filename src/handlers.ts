@@ -96,7 +96,7 @@ function alreadyWatched(store: Store, entityKind: string, entityId: string): boo
 
 async function fail(d: AppDeps, source: string, reason: string, payload: unknown): Promise<HandlerResult> {
   d.store.recordFailure(source, reason, payload)
-  await notify(d.config.notifyUrl, `${source}: ${reason}`)
+  await notify(d.config.notifyUrl, `${source}: ${reason}`, d.fetchImpl)
   return { status: 'failed', reason }
 }
 

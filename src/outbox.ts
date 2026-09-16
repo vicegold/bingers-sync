@@ -34,7 +34,7 @@ async function haltGate(deps: SyncDeps, gate: Gate, reason: string): Promise<voi
   gate.halt(reason)
   if (already) return
   try { deps.store.recordFailure('gate', `writes halted: ${reason}`, { reason }) } catch { /* store is best-effort here */ }
-  await notify(deps.notifyUrl ?? null, `Bingers writes halted: ${reason}`)
+  await notify(deps.notifyUrl ?? null, `Bingers writes halted: ${reason}`, deps.fetchImpl)
 }
 
 function isUnauthorized(msg: string): boolean {

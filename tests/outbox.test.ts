@@ -208,19 +208,17 @@ describe('date corrections survive the outbox', () => {
 // notify". A 401 raised by applyDates used to escape unwrapped, leaving the
 // gate OPEN, and no halt anywhere ever notified.
 describe('gate halts are notified, whichever call saw the 401', () => {
-  const withGlobalFetch = async (fn: (posted: { url: string }[]) => Promise<void>) => {
-    const posted: { url: string }[] = []
-    vi.stubGlobal('fetch', vi.fn(async (url: string) => { posted.push({ url: String(url) }); return new Response('{}', { status: 200 }) }))
-    try { await fn(posted) } finally { vi.unstubAllGlobals() }
-  }
+  // notify() uses deps.fetchImpl (see src/notify.ts / src/outbox.ts haltGate),
+  // so the notification lands on the SAME mock used for the API calls rather
+  // than the global fetch -- the hook url is picked out of that mock's calls.
+  const postedTo = (f: any) => (f as any).mock.calls.some((c: any[]) => c[0] === 'http://hook')
 
   it('notifies when a 401 from sync/push halts the gate', async () => {
-    await withGlobalFetch(async posted => {
-      const gate = createGate()
-      expect(await submit({ ...mk(boom(401)), notifyUrl: 'http://hook' }, gate, [OP('1')])).toBe('halted')
-      expect(gate.halted).toBe(true)
-      expect(posted.some(p => p.url === 'http://hook')).toBe(true)
-    })
+    const f = boom(401)
+    const gate = createGate()
+    expect(await submit({ ...mk(f), notifyUrl: 'http://hook' }, gate, [OP('1')])).toBe('halted')
+    expect(gate.halted).toBe(true)
+    expect(postedTo(f)).toBe(true)
     expect(store.listFailures().some(x => x.source === 'gate')).toBe(true)
     expect(store.outboxDepth()).toBe(1)
   })
@@ -234,11 +232,9 @@ describe('gate halts are notified, whichever call saw the 401', () => {
       return new Response('{}', { status: 401 })
     })
     const gate = createGate()
-    await withGlobalFetch(async posted => {
-      await submit({ ...mk(f), notifyUrl: 'http://hook' }, gate,
-        [OP('1')], [{ entityKind: 'episode', entityId: 'E1', watchedAt: '2026-08-29T10:40:00.000Z' }])
-      expect(posted.some(p => p.url === 'http://hook')).toBe(true)
-    })
+    await submit({ ...mk(f), notifyUrl: 'http://hook' }, gate,
+      [OP('1')], [{ entityKind: 'episode', entityId: 'E1', watchedAt: '2026-08-29T10:40:00.000Z' }])
+    expect(postedTo(f)).toBe(true)
     expect(gate.halted).toBe(true)
     expect(gate.reason).toMatch(/401/)
     // and the un-corrected dates are recorded so they can be replayed by hand
@@ -248,10 +244,9 @@ describe('gate halts are notified, whichever call saw the 401', () => {
   it('notifies when a 401 during a flush halts the gate', async () => {
     await submit(mk(boom(500)), createGate(), [OP('1')])
     const gate = createGate()
-    await withGlobalFetch(async posted => {
-      await flushOutbox({ ...mk(boom(401)), notifyUrl: 'http://hook' }, gate)
-      expect(posted.some(p => p.url === 'http://hook')).toBe(true)
-    })
+    const f = boom(401)
+    await flushOutbox({ ...mk(f), notifyUrl: 'http://hook' }, gate)
+    expect(postedTo(f)).toBe(true)
     expect(gate.halted).toBe(true)
     expect(store.outboxDepth()).toBe(1)
   })
