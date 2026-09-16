@@ -184,3 +184,29 @@ describe('pullOnce', () => {
     expect(store.getMirrorSyncedAt()).toBeNull()
   })
 })
+
+// An unconfigured container boots with no cookie and sends the user to /setup.
+// Until they get there, pulling can only ever 401 -- and a 401 on the boot pull
+// writes a failures row and fires the notify webhook, so a container that is
+// merely unconfigured reports itself as broken.
+describe('pullOnce without a session', () => {
+  const noSession = (f: any) => ({
+    auth: createAuth(store, '', 'UA'), store, userAgent: 'UA', dryRun: true,
+    watchDateToleranceSec: 120, fetchImpl: f as typeof fetch,
+  })
+
+  it('does not call bingers at all', async () => {
+    const f = vi.fn()
+    await pullOnce(noSession(f))
+    expect(f).not.toHaveBeenCalled()
+  })
+
+  it('does not throw, so boot records no failure and sends no alert', async () => {
+    await expect(pullOnce(noSession(vi.fn()))).resolves.toBeUndefined()
+  })
+
+  it('leaves the mirror marked stale rather than falsely fresh', async () => {
+    await pullOnce(noSession(vi.fn()))
+    expect(store.getCursor('__mirror_synced_at')).toBeNull()
+  })
+})

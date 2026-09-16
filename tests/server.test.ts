@@ -127,3 +127,112 @@ describe('routes stay 200 when the handler or the store itself fails', () => {
     expect(res.status).toBe(200)
   })
 })
+
+// ---------------------------------------------------------------------------
+// /setup -- self-closing. It exists to acquire a session cookie, so it answers
+// only while there is no working one. See src/bingers/magic-link.ts for why
+// redemption is reachable from a container when sending a link is not.
+// ---------------------------------------------------------------------------
+
+const NO_COOKIE = loadConfig({
+  PLEX_URL: 'http://plex', PLEX_TOKEN: 'pt', ALLOWED_USER: 'testuser',
+} as NodeJS.ProcessEnv)
+
+const VERIFIED = () => new Response(null, {
+  status: 302,
+  headers: { 'set-cookie': '__Secure-better-auth.session_token=FRESH; Max-Age=31536000; Path=/; Secure' },
+})
+
+const setupApp = (opts: { cookie?: string; gate?: ReturnType<typeof createGate>; fetchImpl?: any } = {}) => {
+  const gate = opts.gate ?? createGate()
+  const fetchImpl = opts.fetchImpl ?? vi.fn(async (url: any) =>
+    String(url).includes('/auth/magic-link/verify')
+      ? VERIFIED()
+      : new Response(JSON.stringify({ session: { expiresAt: '2027-09-16T08:20:14.792Z' } }), { status: 200 }))
+  const auth = createAuth(store, opts.cookie ?? '', 'UA')
+  return { gate, auth, fetchImpl, app: createApp({ config: NO_COOKIE, store, auth, gate, fetchImpl }) }
+}
+
+const paste = (link: string) => ({
+  method: 'POST',
+  headers: { 'content-type': 'application/x-www-form-urlencoded' },
+  body: new URLSearchParams({ link }).toString(),
+})
+
+const LINK = 'https://bingers.app/m?token=JGuDntNbHscqfMOINyLoLIZrrCDVjNzu'
+
+describe('/setup', () => {
+  it('serves the setup page while there is no session', async () => {
+    const res = await setupApp().app.request('/setup')
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/html')
+    expect(await res.text()).toContain('<form')
+  })
+
+  it('closes itself once a session exists', async () => {
+    const res = await setupApp({ cookie: 'ALREADY' }).app.request('/setup')
+    expect(res.status).toBe(404)
+  })
+
+  // The other way in: the session was fine and went dead. A 401 anywhere on the
+  // write path halts the gate, and that is exactly when setup has to reopen --
+  // otherwise re-authenticating means editing .env and restarting again.
+  it('reopens when the write gate has halted on a dead session', async () => {
+    const gate = createGate()
+    gate.halt('bingers 401')
+    const res = await setupApp({ cookie: 'STALE', gate }).app.request('/setup')
+    expect(res.status).toBe(200)
+  })
+
+  it('redeems a pasted link and persists the session', async () => {
+    const { app, auth } = setupApp()
+    const res = await app.request('/setup', paste(LINK))
+    expect(res.status).toBe(200)
+    expect(auth.cookieHeader()).toBe('__Secure-better-auth.session_token=FRESH')
+    expect(store.getAuthState()!.cookie).toBe('FRESH')
+  })
+
+  // Without this the service sits halted until the next daily heartbeat, which
+  // makes a successful setup look like it did nothing.
+  it('resumes writing once a session has been acquired', async () => {
+    const gate = createGate()
+    gate.halt('bingers 401')
+    const { app } = setupApp({ cookie: 'STALE', gate })
+    await app.request('/setup', paste(LINK))
+    expect(gate.halted).toBe(false)
+  })
+
+  it('records how long the new session lasts, so /health is right immediately', async () => {
+    const { app } = setupApp()
+    await app.request('/setup', paste(LINK))
+    expect(store.getAuthState()!.expiresAt).toBe('2027-09-16T08:20:14.792Z')
+  })
+
+  it('rejects a paste with no token in it and stays open', async () => {
+    const { app, auth } = setupApp()
+    const res = await app.request('/setup', paste('I could not find the link'))
+    expect(res.status).toBe(400)
+    expect(auth.hasSession()).toBe(false)
+    expect((await setupApp().app.request('/setup')).status).toBe(200)
+  })
+
+  // A token is single-use: tapping the email instead of copying it spends the
+  // token, and the paste that follows arrives already dead.
+  it('reports a spent token without claiming success', async () => {
+    const { app, auth } = setupApp({ fetchImpl: vi.fn(async () => new Response('{}', { status: 400 })) })
+    const res = await app.request('/setup', paste(LINK))
+    expect(res.status).toBe(502)
+    expect(auth.hasSession()).toBe(false)
+  })
+
+  it('refuses a paste once a session already exists', async () => {
+    const { app } = setupApp({ cookie: 'ALREADY' })
+    expect((await app.request('/setup', paste(LINK))).status).toBe(404)
+  })
+
+  it('tells /health whether setup is still needed', async () => {
+    expect(await (await setupApp().app.request('/health')).json()).toMatchObject({ setupRequired: true })
+    expect(await (await setupApp({ cookie: 'TOK' }).app.request('/health')).json())
+      .toMatchObject({ setupRequired: false })
+  })
+})

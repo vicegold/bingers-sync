@@ -80,6 +80,13 @@ export async function applyDates(deps: SyncDeps, dated: DatedWrite[]): Promise<n
 }
 
 export async function pullOnce(deps: SyncDeps): Promise<void> {
+  // No cookie means the container has never been set up. Pulling would 401,
+  // and a 401 here writes a failures row and fires the notify webhook -- so an
+  // unconfigured container would announce itself as a broken one. Do nothing
+  // instead and leave the mirror stale, which is exactly what it is. /setup is
+  // where this gets resolved; the next scheduled pull picks up from there.
+  if (!deps.auth.hasSession()) return
+
   const names = ['follows', 'entries', 'catalog', 'prefs', 'settings'] as const
   const qs = new URLSearchParams()
   for (const n of names) {

@@ -1,7 +1,9 @@
 import { z } from 'zod'
 
 const Schema = z.object({
-  BINGERS_SESSION_COOKIE: z.string().min(1),
+  // Optional, unlike every other secret: an unconfigured container has to boot
+  // far enough to serve /setup, which is where the cookie now comes from.
+  BINGERS_SESSION_COOKIE: z.string().default(''),
   BINGERS_USER_AGENT: z.string().default('Bingers/55 CFNetwork/3896.100.1.2.1 Darwin/27.0.0'),
   PLEX_URL: z.string().min(1),
   PLEX_TOKEN: z.string().min(1),

@@ -13,6 +13,18 @@ describe('createAuth', () => {
     expect(a.cookieHeader()).toBe('__Secure-better-auth.session_token=TOK')
   })
 
+  // Drives the self-closing /setup gate: with no cookie from either source
+  // there is nothing to sync with, and the setup page has to be reachable.
+  it('reports no session when neither the store nor the config has a cookie', () => {
+    expect(createAuth(store, '', 'UA').hasSession()).toBe(false)
+    expect(createAuth(store, 'TOK', 'UA').hasSession()).toBe(true)
+  })
+
+  it('reports a session once one has been persisted, even with no configured cookie', () => {
+    store.putAuthState({ cookie: 'FROM_SETUP', expiresAt: null, rotatedAt: null, checkedAt: null })
+    expect(createAuth(store, '', 'UA').hasSession()).toBe(true)
+  })
+
   it('prefers a persisted rotated cookie over the configured one', () => {
     store.putAuthState({ cookie: 'ROTATED', expiresAt: null, rotatedAt: null, checkedAt: null })
     expect(createAuth(store, 'TOK', 'UA').cookieHeader()).toBe('__Secure-better-auth.session_token=ROTATED')

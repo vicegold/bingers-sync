@@ -47,4 +47,12 @@ describe('loadConfig', () => {
   it('throws when a required secret is missing', () => {
     expect(() => loadConfig({ PLEX_URL: 'x', PLEX_TOKEN: 'y' } as NodeJS.ProcessEnv)).toThrow()
   })
+
+  // The cookie is no longer a boot-time requirement: a fresh container comes up
+  // with none and sends you to /setup to get one. Requiring it here would make
+  // the unconfigured container refuse to start and never serve that page.
+  it('boots without BINGERS_SESSION_COOKIE', () => {
+    const { BINGERS_SESSION_COOKIE, ...without } = base as Record<string, string>
+    expect(loadConfig(without as NodeJS.ProcessEnv).bingersCookie).toBe('')
+  })
 })

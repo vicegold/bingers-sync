@@ -19,6 +19,8 @@ export function createAuth(store: Store, initialCookie: string, userAgent: strin
   return {
     cookieHeader() { return `${COOKIE_NAME}=${cookie}` },
 
+    hasSession() { return cookie !== '' },
+
     absorb(res: Response) {
       const raw = (res.headers as any).getSetCookie?.() ?? [res.headers.get('set-cookie')].filter(Boolean)
       for (const line of raw as string[]) {
