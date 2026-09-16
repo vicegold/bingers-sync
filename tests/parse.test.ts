@@ -48,6 +48,23 @@ describe('parsePlexScrobble', () => {
     expect(parsePlexScrobble(new FormData())).toBeNull()
   })
 
+  it('returns null when the payload part contains malformed JSON', () => {
+    const f = new FormData()
+    f.set('payload', '{"event": "media.scrobble"')
+    expect(parsePlexScrobble(f)).toBeNull()
+    const f2 = new FormData()
+    f2.set('payload', 'not json at all')
+    expect(parsePlexScrobble(f2)).toBeNull()
+  })
+
+  it('defaults viewCount to 1 and lastViewedAt to null when omitted', () => {
+    const p = parsePlexScrobble(form({
+      ...PLEX, Metadata: { ...PLEX.Metadata, viewCount: undefined, lastViewedAt: undefined },
+    }))!
+    expect(p.viewCount).toBe(1)
+    expect(p.lastViewedAt).toBeNull()
+  })
+
   it('reads movie scrobbles with no season or episode number', () => {
     const p = parsePlexScrobble(form({
       ...PLEX, Metadata: { ...PLEX.Metadata, type: 'movie', grandparentRatingKey: undefined, parentIndex: undefined, index: undefined },
@@ -55,6 +72,7 @@ describe('parsePlexScrobble', () => {
     expect(p.type).toBe('movie')
     expect(p.season).toBeNull()
     expect(p.showRatingKey).toBeNull()
+    expect(p.number).toBeNull()
   })
 })
 
