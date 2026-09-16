@@ -47,8 +47,30 @@ describe('resolveEpisode', () => {
   })
 
   it('fails cleanly for an episode the catalog does not have', async () => {
-    const r = await resolveEpisode(deps(routed(ROUTES)), { titleId: 'T1', season: 9, number: 9 })
+    const r = await resolveEpisode(deps(routed(ROUTES)), { titleId: 'T1', season: 9, number: 9 }) as any
     expect(r).toHaveProperty('failure')
+    expect(r.retryable).toBeUndefined() // season 9 genuinely does not exist
+  })
+
+  // I6 -- the same defect on the episode side: one season's fetch failing must
+  // not read as "that episode does not exist".
+  it('reports an unfetchable season as inconclusive rather than as a missing episode', async () => {
+    const f = vi.fn(async (url: string) => {
+      if (url.includes('versions.json')) return new Response(JSON.stringify(fx('versions-tires')), { status: 200 })
+      if (url.includes('season-1@')) return new Response('upstream boom', { status: 503 })
+      return new Response(JSON.stringify({ episodes: [] }), { status: 200 })
+    })
+    const r = await resolveEpisode(deps(f), { titleId: 'T1', season: 1, number: 3 }) as any
+    expect(r.failure).toMatch(/inconclusive/i)
+    expect(r.failure).not.toMatch(/^no episode/)
+    expect(r.retryable).toBe(true)
+    expect(r.details).toMatchObject({ titleId: 'T1', season: 1, number: 3 })
+  })
+
+  it('reports a failed versions.json as retryable', async () => {
+    const f = vi.fn(async () => new Response('gone', { status: 502 }))
+    const r = await resolveEpisode(deps(f), { titleId: 'T1', season: 1, number: 3 }) as any
+    expect(r.retryable).toBe(true)
   })
 
   it('re-hydrates when an episode is missing, picking up a newly aired one', async () => {

@@ -1,4 +1,8 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { openStore, type Store } from '../src/store.js'
 
 let s: Store
@@ -138,5 +142,88 @@ describe('auth_state', () => {
     const result = s.getAuthState()
     expect(result).toEqual(auth2)
     expect(result!.cookie).toBe('new_session')
+  })
+})
+
+describe('mirror freshness marker', () => {
+  it('is null until a pull has actually succeeded', () => {
+    expect(s.getMirrorSyncedAt()).toBeNull()
+  })
+
+  it('round-trips and overwrites the last successful pull time', () => {
+    s.markMirrorSynced('2026-09-16T10:00:00.000Z')
+    expect(s.getMirrorSyncedAt()).toBe('2026-09-16T10:00:00.000Z')
+    s.markMirrorSynced('2026-09-16T11:00:00.000Z')
+    expect(s.getMirrorSyncedAt()).toBe('2026-09-16T11:00:00.000Z')
+  })
+
+  it('does not collide with a server stream cursor', () => {
+    s.setCursor('entries', 'c1')
+    s.markMirrorSynced('2026-09-16T10:00:00.000Z')
+    expect(s.getCursor('entries')).toBe('c1')
+  })
+})
+
+describe('outbox watch dates', () => {
+  const OP = (id: string, entityId: string) => ({
+    opId: id, table: 'entries', pk: { entityKind: 'episode', entityId },
+    fields: { watched: true, plays: 1, batchId: null },
+  })
+
+  it('persists the intended watch time alongside a queued op', () => {
+    s.enqueueOps([OP('o1', 'E1'), OP('o2', 'E2')] as any,
+      [{ entityKind: 'episode', entityId: 'E1', watchedAt: '2026-08-29T10:40:00.000Z' }])
+    expect(s.watchedAtFor(['o1', 'o2'])).toEqual({ o1: '2026-08-29T10:40:00.000Z' })
+  })
+
+  it('keeps the watch time out of the op payload so nothing new reaches the wire', () => {
+    s.enqueueOps([OP('o1', 'E1')] as any,
+      [{ entityKind: 'episode', entityId: 'E1', watchedAt: '2026-08-29T10:40:00.000Z' }])
+    const [rt] = s.dueOps(new Date().toISOString())
+    expect(rt).toEqual(OP('o1', 'E1'))
+    expect('watchedAt' in rt!).toBe(false)
+  })
+
+  it('returns an empty map for ops with no recorded date', () => {
+    s.enqueueOps([OP('o1', 'E1')] as any)
+    expect(s.watchedAtFor(['o1'])).toEqual({})
+    expect(s.watchedAtFor([])).toEqual({})
+  })
+})
+
+// The schema is created with CREATE TABLE IF NOT EXISTS, so a column added
+// after the first release never appears on a database that already exists.
+describe('outbox schema migration on an existing database', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'bingers-store-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('adds watched_at to an outbox table created before the column existed', () => {
+    const path = join(dir, 'legacy.db')
+    // Exactly the pre-change table definition.
+    const legacy = new Database(path)
+    legacy.exec(`CREATE TABLE outbox (
+      op_id TEXT PRIMARY KEY, batch_id TEXT, table_name TEXT NOT NULL,
+      pk_json TEXT NOT NULL, fields_json TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, next_try_at TEXT,
+      status TEXT NOT NULL, created_at TEXT NOT NULL)`)
+    legacy.prepare(`INSERT INTO outbox VALUES ('old1', null, 'entries', '{"entityKind":"episode","entityId":"E9"}', '{"fields":{"watched":true,"plays":1,"batchId":null}}', 0, null, 'pending', '2026-09-01T00:00:00.000Z')`).run()
+    legacy.close()
+
+    const store = openStore(path)
+    // The pre-existing queued op survives and still flushes...
+    expect(store.outboxDepth()).toBe(1)
+    expect(store.dueOps(new Date().toISOString())[0]?.opId).toBe('old1')
+    expect(store.watchedAtFor(['old1'])).toEqual({})
+    // ...and new ops can record a watch date.
+    store.enqueueOps([{ opId: 'new1', table: 'entries', pk: { entityKind: 'episode', entityId: 'E1' }, fields: {} }] as any,
+      [{ entityKind: 'episode', entityId: 'E1', watchedAt: '2026-08-29T10:40:00.000Z' }])
+    expect(store.watchedAtFor(['new1'])).toEqual({ new1: '2026-08-29T10:40:00.000Z' })
+    store.close()
+
+    // Re-opening is idempotent: the guarded ALTER must not throw a second time.
+    const again = openStore(path)
+    expect(again.watchedAtFor(['new1'])).toEqual({ new1: '2026-08-29T10:40:00.000Z' })
+    again.close()
   })
 })

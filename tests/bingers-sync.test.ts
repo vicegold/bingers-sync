@@ -149,4 +149,18 @@ describe('pullOnce', () => {
     expect(store.getCursor('catalog')).toBeNull()
     expect(store.getCursor('follows')).toBe('2026-09-16T10:00:00.000Z')
   })
+
+  // C1 -- the marker every "is the mirror trustworthy?" check reads.
+  it('marks the mirror synced only after a pull actually succeeds', async () => {
+    const f = vi.fn(async () => new Response(JSON.stringify({ cursors: {} }), { status: 200 }))
+    expect(store.getMirrorSyncedAt()).toBeNull()
+    await pullOnce(mk(false, f))
+    expect(store.getMirrorSyncedAt()).not.toBeNull()
+  })
+
+  it('leaves the mirror marked stale when the pull fails', async () => {
+    const f = vi.fn(async () => new Response('{}', { status: 503 }))
+    await expect(pullOnce(mk(false, f))).rejects.toThrow(/503/)
+    expect(store.getMirrorSyncedAt()).toBeNull()
+  })
 })

@@ -24,6 +24,32 @@ describe('routes', () => {
     expect(await res.json()).toMatchObject({ ok: true, dryRun: true, writesHalted: false, outboxDepth: 0 })
   })
 
+  // C1 -- while the mirror is not fresh, backfill is suppressed. That has to be
+  // visible from outside, or the service looks perfectly healthy while quietly
+  // doing half its job.
+  it('surfaces a cold mirror and the suppressed backfill in /health', async () => {
+    const res = await app().request('/health')
+    expect(await res.json()).toMatchObject({
+      mirrorSyncedAt: null, mirrorFresh: false, backfillEnabled: false, mirrorMaxAgeMin: 60,
+    })
+  })
+
+  it('reports the mirror fresh once a pull has succeeded', async () => {
+    store.markMirrorSynced()
+    const res = await app().request('/health')
+    const b = await res.json() as any
+    expect(b.mirrorFresh).toBe(true)
+    expect(b.backfillEnabled).toBe(true)
+    expect(b.mirrorSyncedAt).toBeTruthy()
+  })
+
+  it('reports the mirror stale again once the last pull ages out', async () => {
+    store.markMirrorSynced(new Date(Date.now() - 61 * 60_000).toISOString())
+    const b = await (await app().request('/health')).json() as any
+    expect(b.mirrorFresh).toBe(false)
+    expect(b.backfillEnabled).toBe(false)
+  })
+
   it('accepts a plex multipart post and returns 200', async () => {
     const f = new FormData()
     f.set('payload', JSON.stringify({ event: 'media.scrobble', Account: { title: 'someone-else' }, Metadata: { type: 'episode' } }))

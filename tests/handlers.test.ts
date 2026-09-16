@@ -18,15 +18,31 @@ const CONFIG = loadConfig({
 let n = 0
 const newId = () => `id-${++n}`
 
-function router(routes: [RegExp, unknown][]) {
+type Body = unknown | ((init: any) => unknown)
+
+function router(routes: [RegExp, Body][]) {
   const calls: { url: string; init?: any }[] = []
   const f = vi.fn(async (url: string, init?: any) => {
     calls.push({ url, init })
-    for (const [re, body] of routes) if (re.test(url)) return new Response(JSON.stringify(body), { status: 200 })
+    for (const [re, body] of routes) {
+      if (!re.test(url)) continue
+      const b = typeof body === 'function' ? (body as (i: any) => unknown)(init) : body
+      return new Response(JSON.stringify(b), { status: 200 })
+    }
     return new Response('{}', { status: 404 })
   })
   return { f, calls }
 }
+
+// The real /sync/push reports per-op status. The previous stub returned
+// `{ results: [] }` -- i.e. "the server applied NOTHING" -- while every test
+// asserted status 'ok', which encoded the discarded-results defect as expected
+// behaviour. Echo the posted ops as applied, which is what a healthy server
+// does, and stub rejection explicitly where that is what is under test.
+const pushEcho = (init: any) => ({
+  results: (init?.body ? JSON.parse(init.body).ops : []).map((o: any) => ({ opId: o.opId, status: 'applied' })),
+  rows: {},
+})
 
 const SCROBBLE = {
   user: 'plexuser', type: 'episode' as const, showRatingKey: '90363',
@@ -34,7 +50,7 @@ const SCROBBLE = {
   year: 2024, season: 1, number: 3, viewCount: 1, lastViewedAt: 1789553428,
 }
 
-const ROUTES: [RegExp, unknown][] = [
+const ROUTES: [RegExp, Body][] = [
   [/library\/metadata\/90363\?includeGuids/, { MediaContainer: { Metadata: [{ Guid: [{ id: 'tmdb://247522' }] }] } }],
   [/allLeaves/, { MediaContainer: { Metadata: [
     { parentIndex: 1, index: 1, viewCount: 1, lastViewedAt: 1788000000 },
@@ -48,7 +64,7 @@ const ROUTES: [RegExp, unknown][] = [
   [/season-0@cccc00000003/, { episodes: [] }],
   [/me\/watches\?/, { watches: [{ id: 'w1', watchedAt: '2026-09-16T12:00:00.000Z' }] }],
   [/me\/watches\//, { entry: {} }],
-  [/sync\/push/, { results: [], rows: {} }],
+  [/sync\/push/, pushEcho],
 ]
 
 const deps = (f: any) => ({ config: CONFIG, store, auth: createAuth(store, 'TOK', 'UA'), gate: createGate(), fetchImpl: f as typeof fetch, newId })
@@ -69,6 +85,7 @@ describe('handlePlex', () => {
   })
 
   it('pushes the scrobbled episode and only plex-watched backfill episodes', async () => {
+    store.markMirrorSynced() // backfill requires a fresh mirror -- see the C1 tests below
     const { f, calls } = router(ROUTES)
     await handlePlex(deps(f), SCROBBLE)
     const push = calls.find(c => /sync\/push/.test(c.url))!
@@ -94,6 +111,7 @@ describe('handlePlex', () => {
   })
 
   it('does not re-write an episode already watched on bingers', async () => {
+    store.markMirrorSynced()
     store.putSyncRows('entries', [{ pk: 'episode:019f6bb9-65fd-7ef3-8053-8e3333a9f110', row: { watched: true, deletedAt: null } }])
     const { f, calls } = router(ROUTES)
     await handlePlex(deps(f), SCROBBLE)
@@ -129,12 +147,153 @@ describe('handlePlex', () => {
   })
 })
 
+const entryIds = (calls: { url: string; init?: any }[]) =>
+  JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
+    .filter((o: any) => o.table === 'entries').map((o: any) => o.pk.entityId)
+
+const SCROBBLED_EP = '019f6bb9-65fd-7ef3-8053-8e3333a9f117'
+const BACKFILL_EP = '019f6bb9-65fd-7ef3-8053-8e3333a9f110'
+
+// C1 -- backfill must not degrade to "write everything" when the boot pull failed.
+describe('handlePlex backfill guard (mirror freshness)', () => {
+  it('skips backfill when the mirror has never synced, but still writes the scrobbled episode', async () => {
+    // Default state: no successful sync/pull has ever run, so sync_state is
+    // empty. Without the guard, alreadyWatched() returns false for EVERY
+    // episode and the whole show is pushed and re-dated.
+    const { f, calls } = router(ROUTES)
+    const r = await handlePlex(deps(f), SCROBBLE)
+    expect(r.status).toBe('ok')
+    expect(entryIds(calls)).toEqual([SCROBBLED_EP])
+  })
+
+  it('records a visible failures row explaining that backfill was skipped', async () => {
+    const { f } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE)
+    const reasons = store.listFailures().map(x => x.reason)
+    expect(reasons.some(x => /backfill skipped/.test(x))).toBe(true)
+    expect(reasons.some(x => /never succeeded/.test(x))).toBe(true)
+  })
+
+  it('skips backfill when the last successful pull is older than twice the pull interval', async () => {
+    // syncPullIntervalMin defaults to 30, so anything past 60 minutes is stale.
+    store.markMirrorSynced(new Date(Date.now() - 61 * 60_000).toISOString())
+    const { f, calls } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE)
+    expect(entryIds(calls)).toEqual([SCROBBLED_EP])
+    expect(store.listFailures().some(x => /backfill skipped/.test(x.reason))).toBe(true)
+  })
+
+  it('backfills normally while the mirror is inside the freshness window', async () => {
+    store.markMirrorSynced(new Date(Date.now() - 5 * 60_000).toISOString())
+    const { f, calls } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE)
+    expect(entryIds(calls)).toContain(BACKFILL_EP)
+    expect(store.listFailures().some(x => /backfill skipped/.test(x.reason))).toBe(false)
+  })
+})
+
+// M7 / M8 -- nothing non-finite and nothing undated may reach the wire.
+describe('handlePlex leaf hygiene', () => {
+  it('defaults plays to 1 when plex sends a non-numeric viewCount instead of serialising null', async () => {
+    store.markMirrorSynced()
+    const { f, calls } = router(ROUTES)
+    await handlePlex(deps(f), { ...SCROBBLE, viewCount: Number('not-a-number') })
+    const body = calls.find(c => /sync\/push/.test(c.url))!.init.body
+    expect(body).not.toContain('"plays":null')
+    const op = JSON.parse(body).ops.find((o: any) => o.pk?.entityId === SCROBBLED_EP)
+    expect(op.fields.plays).toBe(1)
+  })
+
+  it('excludes a backfill leaf with a non-finite viewCount rather than letting NaN through the <1 filter', async () => {
+    store.markMirrorSynced()
+    const { f, calls } = router([
+      [/allLeaves/, { MediaContainer: { Metadata: [
+        { parentIndex: 1, index: 1, viewCount: 'lots', lastViewedAt: 1788000000 },
+        { parentIndex: 1, index: 3, viewCount: 1, lastViewedAt: 1789553428 },
+      ] } }],
+      ...ROUTES,
+    ])
+    await handlePlex(deps(f), SCROBBLE)
+    expect(entryIds(calls)).toEqual([SCROBBLED_EP])
+  })
+
+  it('excludes a backfill leaf with no lastViewedAt rather than inventing today as its watch date', async () => {
+    store.markMirrorSynced()
+    const { f, calls } = router([
+      [/allLeaves/, { MediaContainer: { Metadata: [
+        { parentIndex: 1, index: 1, viewCount: 2 }, // watched, but plex has no timestamp
+        { parentIndex: 1, index: 3, viewCount: 1, lastViewedAt: 1789553428 },
+      ] } }],
+      ...ROUTES,
+    ])
+    await handlePlex(deps(f), SCROBBLE)
+    expect(entryIds(calls)).not.toContain(BACKFILL_EP)
+    expect(entryIds(calls)).toEqual([SCROBBLED_EP])
+  })
+})
+
+// I2 -- a 200 whose per-op results reject an entry must not read as 'sent'.
+describe('handlePlex honours per-op push results', () => {
+  const rejectAll = () => ({
+    results: [] as { opId: string; status: string }[], rows: {},
+  })
+
+  it('queues unconfirmed ops and records the shortfall instead of silently dropping them', async () => {
+    store.markMirrorSynced()
+    // Overrides go FIRST: router() returns the first matching route.
+    const { f } = router([[/sync\/push/, rejectAll], ...ROUTES])
+    const r = await handlePlex(deps(f), SCROBBLE)
+    expect(r.status).toBe('ok') // still 200-shaped for plex
+    expect(store.outboxDepth()).toBeGreaterThan(0)
+    expect(store.listFailures().some(x => /bingers confirmed 0\//.test(x.reason))).toBe(true)
+  })
+
+  it('keeps a partially rejected op for retry while the confirmed one is done', async () => {
+    store.markMirrorSynced()
+    const partial = (init: any) => {
+      const ops = JSON.parse(init.body).ops
+      return { results: ops.slice(0, 1).map((o: any) => ({ opId: o.opId, status: 'applied' })), rows: {} }
+    }
+    const { f } = router([[/sync\/push/, partial], ...ROUTES])
+    await handlePlex(deps(f), SCROBBLE)
+    const pushed = JSON.parse((f as any).mock.calls.find((c: any[]) => /sync\/push/.test(c[0]))[1].body).ops
+    expect(store.outboxDepth()).toBe(pushed.length - 1)
+  })
+})
+
+// Binge behaviour: a confirmed write is mirrored locally at once, rather than
+// waiting up to SYNC_PULL_INTERVAL_MIN for the next pull to reveal it.
+describe('optimistic local mirror', () => {
+  it('does not re-push an episode a previous scrobble already wrote', async () => {
+    store.markMirrorSynced()
+    const { f, calls } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE)
+    expect(entryIds(calls)).toContain(BACKFILL_EP)
+
+    // Second scrobble of the same show, mirror not refreshed in between.
+    const second = router(ROUTES)
+    await handlePlex(deps(second.f), { ...SCROBBLE, number: 1, lastViewedAt: 1788000000 })
+    const ids = entryIds(second.calls)
+    expect(ids).not.toContain(SCROBBLED_EP)
+  })
+
+  it('marks a confirmed follow so the next scrobble does not re-follow', async () => {
+    store.markMirrorSynced()
+    const { f } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE)
+    const second = router(ROUTES)
+    await handlePlex(deps(second.f), SCROBBLE)
+    const ops = JSON.parse(second.calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
+    expect(ops.some((o: any) => o.table === 'follows')).toBe(false)
+  })
+})
+
 describe('handlePulsarr', () => {
   it('follows on added using the verified titleId', async () => {
     const { f, calls } = router([
       [/search\/titles/, { results: [{ id: 'M1', kind: 'show', metadata: 'h', card: { originalTitle: 'The Mentalist', titlesI18n: {}, year: 2008 } }] }],
       [/metadata@h/, { id: 'M1', title: 'The Mentalist', year: 2008, kind: 'show', external_ids: [{ id: '5920', source: 'tmdb' }] }],
-      [/sync\/push/, { results: [], rows: {} }],
+      [/sync\/push/, pushEcho],
     ])
     const r = await handlePulsarr(deps(f), {
       user: 'plexuser', action: 'added', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
@@ -146,7 +305,7 @@ describe('handlePulsarr', () => {
 
   it('uses op-level deleted on removed', async () => {
     store.putTitleMapping([{ source: 'tmdb', extId: '5920', kind: 'show', titleId: 'M1', title: null, year: null }])
-    const { f, calls } = router([[/sync\/push/, { results: [], rows: {} }]])
+    const { f, calls } = router([[/sync\/push/, pushEcho]])
     await handlePulsarr(deps(f), {
       user: 'plexuser', action: 'removed', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
     })

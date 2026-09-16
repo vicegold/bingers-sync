@@ -58,4 +58,37 @@ describe('resolveTitle', () => {
     const r = await resolveTitle(deps(f), { title: 'Nothing', kind: 'show', ids: { tmdb: '1' } })
     expect(r).toHaveProperty('failure')
   })
+
+  // I6 -- a 503 while checking the TRUE candidate is not evidence of a
+  // no-match. Filing it as `no external id match` loses the event forever,
+  // because nothing replays `failures`.
+  describe('a candidate we could not check', () => {
+    // search-tires returns the show (metadata@543408442fd2) plus a movie; only
+    // the show's metadata fetch is attempted for kind 'show', and it 503s.
+    const flaky = vi.fn(async (url: string) => {
+      if (url.includes('/search/titles')) return new Response(JSON.stringify(fx('search-tires')), { status: 200 })
+      return new Response('upstream boom', { status: 503 })
+    })
+
+    it('is reported as inconclusive and retryable, not as a confident no-match', async () => {
+      const r = await resolveTitle(deps(flaky), { title: 'Tires', kind: 'show', ids: { tmdb: '247522' } }) as any
+      expect(r.failure).toMatch(/inconclusive/i)
+      expect(r.failure).not.toMatch(/^no external id match/)
+      expect(r.retryable).toBe(true)
+    })
+
+    it('carries enough detail to replay the lookup by hand', async () => {
+      const r = await resolveTitle(deps(flaky), { title: 'Tires', kind: 'show', ids: { tmdb: '247522' } }) as any
+      expect(r.details).toMatchObject({ title: 'Tires', kind: 'show', ids: { tmdb: '247522' } })
+      expect(r.details.unchecked[0]).toMatchObject({ titleId: '019f6bb9-65cf-78d1-b123-f9ed891fe9d7', metadata: '543408442fd2' })
+      expect(r.details.unchecked[0].error).toMatch(/503/)
+    })
+
+    it('still reports a plain no-match when every candidate WAS checked', async () => {
+      const f = routed({ '/search/titles': fx('search-tires'), 'metadata@543408442fd2': fx('metadata-tires') })
+      const r = await resolveTitle(deps(f), { title: 'Tires', kind: 'show', ids: { tmdb: '999999' } }) as any
+      expect(r.failure).toMatch(/^no external id match/)
+      expect(r.retryable).toBeUndefined()
+    })
+  })
 })

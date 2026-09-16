@@ -43,10 +43,23 @@ CREATE TABLE IF NOT EXISTS auth_state (
   expires_at TEXT, rotated_at TEXT, checked_at TEXT);
 `
 
+// Name of the cursor row that records the last SUCCESSFUL sync/pull. It lives
+// in `cursors` rather than in a new table so it survives on existing databases
+// with no migration, and is double-underscored so it can never collide with a
+// server stream name (follows/entries/catalog/prefs/settings).
+export const MIRROR_CURSOR = '__mirror_synced_at'
+
 export function openStore(dbPath: string) {
   const db = new Database(dbPath)
   db.pragma('journal_mode = WAL')
   db.exec(SCHEMA)
+
+  // SCHEMA uses CREATE TABLE IF NOT EXISTS, so a column added after the first
+  // release never appears on an existing database. Add it explicitly, guarded
+  // by the live column list so this is safe to run on every boot.
+  const outboxCols = (db.prepare('PRAGMA table_info(outbox)').all() as { name: string }[]).map(c => c.name)
+  if (!outboxCols.includes('watched_at')) db.exec('ALTER TABLE outbox ADD COLUMN watched_at TEXT')
+
   const now = () => new Date().toISOString()
 
   return {
@@ -103,6 +116,18 @@ export function openStore(dbPath: string) {
       db.prepare('INSERT INTO cursors (name, value) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value')
         .run(name, value)
     },
+    // Mirror freshness. `null` means sync/pull has never once succeeded, which
+    // is NOT the same as "the mirror says you have watched nothing" -- every
+    // read of sync_state that infers absence (backfill, auto-follow) has to
+    // know the difference.
+    getMirrorSyncedAt(): string | null {
+      const r = db.prepare('SELECT value FROM cursors WHERE name=?').get(MIRROR_CURSOR) as { value: string } | undefined
+      return r?.value ?? null
+    },
+    markMirrorSynced(at?: string) {
+      db.prepare('INSERT INTO cursors (name, value) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value')
+        .run(MIRROR_CURSOR, at ?? now())
+    },
     recordFailure(source: string, reason: string, payload: unknown) {
       db.prepare('INSERT INTO failures (source, reason, payload, created_at) VALUES (?,?,?,?)')
         .run(source, reason, JSON.stringify(payload), now())
@@ -120,16 +145,40 @@ export function openStore(dbPath: string) {
           rotated_at=excluded.rotated_at, checked_at=excluded.checked_at`)
         .run(s.cookie, s.expiresAt, s.rotatedAt, s.checkedAt)
     },
-    enqueueOps(ops: { opId: string; table: string; pk: unknown; [k: string]: unknown }[]) {
-      const st = db.prepare(`INSERT INTO outbox (op_id, batch_id, table_name, pk_json, fields_json, attempts, next_try_at, status, created_at)
-        VALUES (?,?,?,?,?,0,?, 'pending', ?) ON CONFLICT(op_id) DO NOTHING`)
+    // `dated` carries the REAL watch time each entries op should end up with.
+    // It is stored in its own column rather than inside fields_json so the op
+    // payload round-trips byte-identically and no invented key ever reaches
+    // the wire on a later flush.
+    enqueueOps(
+      ops: { opId: string; table: string; pk: unknown; [k: string]: unknown }[],
+      dated: { entityKind: string; entityId: string; watchedAt: string }[] = [],
+    ) {
+      const byEntity = new Map(dated.map(d => [`${d.entityKind}:${d.entityId}`, d.watchedAt]))
+      const st = db.prepare(`INSERT INTO outbox (op_id, batch_id, table_name, pk_json, fields_json, attempts, next_try_at, status, created_at, watched_at)
+        VALUES (?,?,?,?,?,0,?, 'pending', ?, ?) ON CONFLICT(op_id) DO NOTHING`)
       const t = now()
       db.transaction(() => {
         for (const o of ops) {
           const { opId, table, pk, ...rest } = o as any
-          st.run(opId, (rest.fields?.batchId ?? null), table, JSON.stringify(pk), JSON.stringify(rest), t, t)
+          const p = pk as { entityKind?: string; entityId?: string } | null
+          const watchedAt = (table === 'entries' && p?.entityKind && p?.entityId)
+            ? byEntity.get(`${p.entityKind}:${p.entityId}`) ?? null
+            : null
+          st.run(opId, (rest.fields?.batchId ?? null), table, JSON.stringify(pk), JSON.stringify(rest), t, t, watchedAt)
         }
       })()
+    },
+    // Intended watch times for a set of queued ops, keyed by opId. Used after a
+    // flush lands so the dated half of the original Plan is not lost.
+    watchedAtFor(opIds: string[]): Record<string, string> {
+      const out: Record<string, string> = {}
+      if (opIds.length === 0) return out
+      const st = db.prepare('SELECT op_id, watched_at FROM outbox WHERE op_id=?')
+      for (const id of opIds) {
+        const r = st.get(id) as { op_id: string; watched_at: string | null } | undefined
+        if (r?.watched_at) out[r.op_id] = r.watched_at
+      }
+      return out
     },
     dueOps(nowIso: string, limit = 50) {
       const rows = db.prepare(`SELECT op_id, table_name, pk_json, fields_json FROM outbox

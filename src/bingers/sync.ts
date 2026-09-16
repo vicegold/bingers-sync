@@ -8,6 +8,7 @@ const API = 'https://api.bingers.app'
 export type SyncDeps = {
   auth: Auth; store: Store; userAgent: string; dryRun: boolean
   watchDateToleranceSec: number; fetchImpl?: typeof fetch
+  notifyUrl?: string | null
 }
 
 function headers(deps: SyncDeps, json = false): Record<string, string> {
@@ -102,4 +103,9 @@ export async function pullOnce(deps: SyncDeps): Promise<void> {
   for (const [k, v] of Object.entries(b.cursors ?? {})) {
     if (PERSISTED.has(k) && typeof v === 'string') deps.store.setCursor(k, v)
   }
+
+  // Only here, past every throw above: the local mirror now genuinely reflects
+  // Bingers as of this moment. Readers that infer absence from sync_state key
+  // off this marker.
+  deps.store.markMirrorSynced()
 }

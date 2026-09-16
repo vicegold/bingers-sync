@@ -4,7 +4,7 @@ import { loadConfig } from './config.js'
 import { openStore } from './store.js'
 import { createAuth } from './bingers/auth.js'
 import { parsePlexScrobble, parsePulsarr } from './routes/parse.js'
-import { handlePlex, handlePulsarr, type AppDeps } from './handlers.js'
+import { handlePlex, handlePulsarr, mirrorFreshness, type AppDeps } from './handlers.js'
 import { pullOnce } from './bingers/sync.js'
 import { createGate, flushOutbox } from './outbox.js'
 import { notify } from './notify.js'
@@ -12,13 +12,23 @@ import { notify } from './notify.js'
 export function createApp(deps: AppDeps) {
   const app = new Hono()
 
-  app.get('/health', c => c.json({
-    ok: true, dryRun: deps.config.dryRun,
-    sessionDaysRemaining: deps.auth.daysRemaining(),
-    writesHalted: deps.gate.halted,
-    outboxDepth: deps.store.outboxDepth(),
-    failures: deps.store.listFailures(1).length,
-  }))
+  app.get('/health', c => {
+    // Mirror freshness is the single most load-bearing invariant here: while it
+    // is false, backfill is suppressed, so it has to be visible from outside.
+    const mirror = mirrorFreshness(deps.store, deps.config.syncPullIntervalMin)
+    return c.json({
+      ok: true, dryRun: deps.config.dryRun,
+      sessionDaysRemaining: deps.auth.daysRemaining(),
+      writesHalted: deps.gate.halted,
+      haltReason: deps.gate.reason,
+      outboxDepth: deps.store.outboxDepth(),
+      failures: deps.store.listFailures(1).length,
+      mirrorSyncedAt: mirror.syncedAt,
+      mirrorFresh: mirror.fresh,
+      mirrorMaxAgeMin: mirror.maxAgeMin,
+      backfillEnabled: mirror.fresh,
+    })
+  })
 
   // Always 200: a non-2xx makes Plex retry an event that will never resolve.
   app.post('/plex', async c => {
@@ -57,10 +67,20 @@ async function main() {
   const auth = createAuth(store, config.bingersCookie, config.bingersUserAgent)
   const gate = createGate()
   const deps: AppDeps = { config, store, auth, gate }
-  const sd = { auth, store, userAgent: config.bingersUserAgent, dryRun: config.dryRun, watchDateToleranceSec: config.watchDateToleranceSec }
+  const sd = {
+    auth, store, userAgent: config.bingersUserAgent, dryRun: config.dryRun,
+    watchDateToleranceSec: config.watchDateToleranceSec, notifyUrl: config.notifyUrl,
+  }
 
   const pull = async () => {
-    try { await pullOnce(sd) } catch (e) { console.error('[pull]', (e as Error).message) }
+    // A failed pull leaves the mirror stale; serve() still starts (the webhooks
+    // must keep returning 200), but handlePlex reads the freshness marker and
+    // suppresses backfill until a pull succeeds again.
+    try { await pullOnce(sd) } catch (e) {
+      console.error('[pull]', (e as Error).message)
+      store.recordFailure('pull', `sync/pull failed: ${(e as Error).message}`, null)
+      await notify(config.notifyUrl, `Bingers sync/pull failed: ${(e as Error).message} — backfill suppressed until the mirror refreshes`)
+    }
   }
   const beat = async () => {
     try {
