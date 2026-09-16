@@ -44,3 +44,60 @@ describe('routes', () => {
     expect(res.status).toBe(200)
   })
 })
+
+// Payloads that pass the allowed-user filter and reach the handler (so a
+// throw inside the handler -- not the "ignored"/"unparseable" early-return --
+// is what's under test here.
+const plexPayload = () => JSON.stringify({
+  event: 'media.scrobble',
+  Account: { title: 'plexuser' },
+  Metadata: { type: 'movie', title: 'Some Movie', Guid: [{ id: 'tmdb://123' }], viewCount: 1, lastViewedAt: 1700000000 },
+})
+const pulsarrPayload = () => JSON.stringify({
+  event: 'watchlist.added',
+  data: { addedBy: { username: 'plexuser' }, content: { title: 'Some Show', type: 'show', guids: ['tmdb:123'] } },
+})
+
+describe('routes stay 200 when the handler or the store itself fails', () => {
+  it('returns 200 and records a failure when handlePlex throws', async () => {
+    store.getTitleId = () => { throw new Error('boom') }
+    const f = new FormData()
+    f.set('payload', plexPayload())
+    const res = await app().request('/plex', { method: 'POST', body: f })
+    expect(res.status).toBe(200)
+    const failures = store.listFailures(1)
+    expect(failures).toHaveLength(1)
+    expect(failures[0]?.reason).toContain('boom')
+  })
+
+  it('returns 200 and records a failure when handlePulsarr throws', async () => {
+    store.getTitleId = () => { throw new Error('boom') }
+    const res = await app().request('/pulsarr', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: pulsarrPayload(),
+    })
+    expect(res.status).toBe(200)
+    const failures = store.listFailures(1)
+    expect(failures).toHaveLength(1)
+    expect(failures[0]?.reason).toContain('boom')
+  })
+
+  it('returns 200 for /plex even when recordFailure itself throws (store is what failed)', async () => {
+    store.getTitleId = () => { throw new Error('boom') }
+    store.recordFailure = () => { throw new Error('database is locked') }
+    const f = new FormData()
+    f.set('payload', plexPayload())
+    const res = await app().request('/plex', { method: 'POST', body: f })
+    expect(res.status).toBe(200)
+  })
+
+  it('returns 200 for /pulsarr even when recordFailure itself throws (store is what failed)', async () => {
+    store.getTitleId = () => { throw new Error('boom') }
+    store.recordFailure = () => { throw new Error('database is locked') }
+    const res = await app().request('/pulsarr', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: pulsarrPayload(),
+    })
+    expect(res.status).toBe(200)
+  })
+})

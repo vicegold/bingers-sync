@@ -27,7 +27,11 @@ export function createApp(deps: AppDeps) {
       if (!s) return c.json({ status: 'ignored' })
       return c.json(await handlePlex(deps, s))
     } catch (e) {
-      deps.store.recordFailure('plex', `handler threw: ${(e as Error).message}`, null)
+      // recordFailure can itself throw (e.g. the store is what failed) -- the
+      // 200 below must not depend on that succeeding, or an unhealthy store
+      // turns this into the 500-and-retry-forever this catch exists to avoid.
+      try { deps.store.recordFailure('plex', `handler threw: ${(e as Error).message}`, null) }
+      catch (e2) { console.error('[plex] recordFailure failed', (e2 as Error).message) }
       return c.json({ status: 'failed' })
     }
   })
@@ -38,7 +42,8 @@ export function createApp(deps: AppDeps) {
       if (!e) return c.json({ status: 'ignored' })
       return c.json(await handlePulsarr(deps, e))
     } catch (e) {
-      deps.store.recordFailure('pulsarr', `handler threw: ${(e as Error).message}`, null)
+      try { deps.store.recordFailure('pulsarr', `handler threw: ${(e as Error).message}`, null) }
+      catch (e2) { console.error('[pulsarr] recordFailure failed', (e2 as Error).message) }
       return c.json({ status: 'failed' })
     }
   })
