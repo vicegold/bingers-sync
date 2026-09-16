@@ -119,11 +119,34 @@ fields are booleans (`forLater`, `stopped`, `watchlistHidden`) where the pull ro
 carry timestamps (`forLaterAt`, `stoppedWatchingAt`, `watchlistHiddenAt`) — the
 server converts.
 
-**Consequence: watch times cannot be backdated** through the shapes the app uses.
-A scrobble that arrives late, and every backfilled episode, will be stamped
-"now". Whether the server also *accepts* a client-supplied `firstWatchedAt` is
-untested and should be probed once during implementation; if it does, use
-Plex's `lastViewedAt`, otherwise accept server time.
+The entry's `firstWatchedAt` / `lastWatchedAt` are **derived** from individual
+watch records, and `plays` is the count of them. To set a real watch date, edit
+the record — see below.
+
+### Watch records — verified
+
+```
+GET   /me/watches?entityKind={kind}&entityId={id}
+→ { watches: [ { id, watchedAt } ] }
+
+PATCH /me/watches/{watchId}
+  { watchedAt, entityKind, entityId }
+→ { entry: { ..., firstWatchedAt, lastWatchedAt, updatedAt } }
+```
+
+Captured backdating an episode from the server-stamped `2026-09-16T10:40:47.414Z`
+to `2026-09-11T10:40:47.414Z`; the response confirms both `firstWatchedAt` and
+`lastWatchedAt` on the entry moved with it.
+
+**Watch times therefore can be backdated**, in three steps: push the entry, read
+back the watch record to get its `id`, then PATCH it. Cost is two extra requests
+per episode beyond the push.
+
+Not yet probed, and worth one attempt during implementation: whether
+`POST /me/watches` accepts `{ entityKind, entityId, watchedAt }` directly. If it
+does, a dated watch becomes a single request and the push/read/patch dance is
+unnecessary. `DELETE /me/watches/{id}` presumably exists too, for correcting a
+mistaken scrobble.
 
 Row shapes observed in `sync/pull`:
 
@@ -162,9 +185,11 @@ action. Out-of-band delivery to the app is APNs push via Expo, registered with
 | `sync/pull` row shapes and cursor formats | **verified** — observed in capture |
 | Cookie auth, no CSRF | **verified** — observed in capture |
 | No websocket/SSE channel exists | **verified** — absent from both captures |
-| Movie entry: `entityKind: "movie"`, `entityId` = titleId | **assumed** |
+| `GET`/`PATCH /me/watches` backdating flow | **verified** — observed in capture 3 |
+| `entityKind: "movie"` exists in entries | **verified** — seen in an entries cursor |
+| Movie `entityId` = titleId | **assumed** |
 | Unfollow shape (likely `fields: { deleted: true }`) | **assumed** |
-| Server accepts client-supplied watch timestamps | **untested** — probe once |
+| `POST /me/watches` for one-step dated writes | **untested** — probe once |
 | Session `expiresAt` slides forward on use | **assumed** — see Auth |
 
 The remaining assumed write shapes are why the service ships with `DRY_RUN=true`.
@@ -349,11 +374,15 @@ body. Accepted only when `Account.title === "plexuser"`.
    that is not already watched.
 5. Push as one batch.
 
-`plays` uses `Metadata.viewCount` when present, else 1. Watch timestamps are
-**not** sent — the server stamps them on receipt (see Push op shapes). Plex's
-`lastViewedAt` is recorded locally in `outbox` so that, if the timestamp probe
-shows the server accepts client-supplied times, the behaviour can be switched on
-without re-deriving anything.
+`plays` uses `Metadata.viewCount` when present, else 1.
+
+5. Date correction: for each entry just written, `GET /me/watches` and `PATCH` the
+   record to the real watch time. The scrobbled episode uses Plex's
+   `lastViewedAt`; backfilled episodes use `BACKFILL_DATE_MODE`.
+
+Step 5 is skipped when the corrected time would equal the server stamp anyway
+(a live scrobble arriving within `WATCH_DATE_TOLERANCE_SEC`), so the common case
+stays at one request.
 
 **Backfill excludes season 0.** Specials appear in `requiredSeasons` and would
 otherwise be swept up by watching a later regular episode. Ordering is by
@@ -446,6 +475,8 @@ DRY_RUN=true               # default; log intended pushes without sending
 PORT=8787
 DB_PATH=/data/bingers-sync.db
 CATALOG_TTL_HOURS=24
+BACKFILL_DATE_MODE=scrobble  # scrobble | server  — date applied to backfilled episodes
+WATCH_DATE_TOLERANCE_SEC=120 # skip the PATCH when server stamp is already close enough
 SEARCH_MAX_PAGES=3         # search/titles pages scanned before declaring failure
 SYNC_PULL_INTERVAL_MIN=30  # refresh of the local follows/entries mirror
 NOTIFY_URL=                # webhook for failure notifications
@@ -474,7 +505,41 @@ NOTIFY_URL=                # webhook for failure notifications
 3. Flip `DRY_RUN=false` for a single known episode; verify in the app.
 4. Point the real Plex and Pulsarr webhooks at the service.
 
+## Reverse sync: Bingers → Plex
+
+Bingers has no realtime channel, so this is the existing `sync/pull` mirror doing
+double duty. Each poll already returns new `follows` rows; reverse sync acts on
+the ones this service did not originate.
+
+```
+sync/pull → new follows[] row
+  ↓  titleId → title_map (already cached, no catalog fetch)
+tvdb / tmdb id
+  ↓
+add to Plex watchlist
+  ↓
+Pulsarr's watchlist.added fires as it does today
+  ↓
+Sonarr / Radarr, routed by Pulsarr's own rules
+```
+
+Going through the Plex watchlist rather than calling Sonarr directly keeps
+quality profile, root folder and season monitoring in Pulsarr, where they already
+live, instead of duplicating them here.
+
+The exact Plex Discover endpoint for adding to a watchlist is **not yet
+verified** — it needs a Discover `ratingKey`, which is not the local library
+`ratingKey`, so a lookup by GUID is required first. This must be confirmed
+against the live Plex API during implementation before the path is enabled.
+
+### Loop prevention
+
+The cycle Bingers follow → Plex watchlist → Pulsarr webhook → Bingers follow
+terminates on its own: by the time Pulsarr's event arrives the title is already
+in `sync_state` as followed, so the forward path treats it as a no-op. Titles
+pushed outward are additionally recorded in `outbox` so the no-op is explicit
+rather than incidental.
+
 ## Out of scope
 
-Bingers → Plex direction; ratings and feelings; lists beyond the watchlist;
-multi-user support; any UI.
+Ratings and feelings; lists beyond the watchlist; multi-user support; any UI.
