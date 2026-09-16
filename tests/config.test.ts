@@ -1,0 +1,44 @@
+import { describe, it, expect } from 'vitest'
+import { loadConfig } from '../src/config.js'
+
+const base = {
+  BINGERS_SESSION_COOKIE: 'tok',
+  PLEX_URL: 'http://plex.local:32400',
+  PLEX_TOKEN: 'plex',
+}
+
+describe('loadConfig', () => {
+  it('applies documented defaults', () => {
+    const c = loadConfig(base as NodeJS.ProcessEnv)
+    expect(c.dryRun).toBe(true)
+    expect(c.allowedUser).toBe('plexuser')
+    expect(c.port).toBe(8787)
+    expect(c.catalogTtlHours).toBe(24)
+    expect(c.searchMaxPages).toBe(3)
+    expect(c.watchDateToleranceSec).toBe(120)
+    expect(c.syncPullIntervalMin).toBe(30)
+    expect(c.plexAllLeavesTtlMin).toBe(60)
+    expect(c.dbPath).toBe('/data/bingers-sync.db')
+    expect(c.notifyUrl).toBeNull()
+    expect(c.bingersUserAgent).toBe('Bingers/55 CFNetwork/3896.100.1.2.1 Darwin/27.0.0')
+  })
+
+  it('strips trailing slashes from PLEX_URL', () => {
+    expect(loadConfig({ ...base, PLEX_URL: 'http://plex.local:32400/' } as NodeJS.ProcessEnv).plexUrl).toBe(
+      'http://plex.local:32400',
+    )
+    expect(loadConfig({ ...base, PLEX_URL: 'http://plex.local:32400///' } as NodeJS.ProcessEnv).plexUrl).toBe(
+      'http://plex.local:32400',
+    )
+  })
+
+  it('only disables dry run for the exact string "false"', () => {
+    expect(loadConfig({ ...base, DRY_RUN: 'false' } as NodeJS.ProcessEnv).dryRun).toBe(false)
+    expect(loadConfig({ ...base, DRY_RUN: '0' } as NodeJS.ProcessEnv).dryRun).toBe(true)
+    expect(loadConfig({ ...base, DRY_RUN: 'FALSE' } as NodeJS.ProcessEnv).dryRun).toBe(true)
+  })
+
+  it('throws when a required secret is missing', () => {
+    expect(() => loadConfig({ PLEX_URL: 'x', PLEX_TOKEN: 'y' } as NodeJS.ProcessEnv)).toThrow()
+  })
+})

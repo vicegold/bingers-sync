@@ -1,0 +1,7 @@
+{"id":"019f6bb9-65cf-78d1-b123-f9ed891fe9d7","title":"Tires","year":2024,"kind":"show",
+ "seasons":[{"season":0},{"season":1}],
+ "external_ids":[
+   {"id":"tt31491435","source":"imdb","type":"IMDB","url":null},
+   {"id":"247522","source":"tmdb","type":"tv","url":null},
+   {"id":"446718","source":"tvdb","type":"series","url":null}
+ ]}

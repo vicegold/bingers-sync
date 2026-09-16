@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: typecheck
+        run: npx tsc --noEmit -p .
+      - name: test
+        run: npm test
+      - name: build
+        run: npm run build
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Only log in when we are actually going to push. Pull requests from
+      # forks have no write access to packages, and the build must still run.
+      - name: log in to ghcr
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build (and push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # amd64 only -- ubuntu-latest runners are amd64, so this is a native
+          # build with no QEMU emulation. better-sqlite3 compiles from source
+          # in the builder stage, and under QEMU that takes minutes instead of
+          # seconds. Add linux/arm64 here only if a target host needs it.
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: smoke test the built image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker pull "$IMAGE:${{ github.sha }}"
+          docker run --rm "$IMAGE:${{ github.sha }}" \
+            node -e "const s=require('better-sqlite3');new s('/tmp/ci.db').exec('create table t(a)');console.log('sqlite ok in runtime image')"
