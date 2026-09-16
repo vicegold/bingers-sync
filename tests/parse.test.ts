@@ -3,7 +3,7 @@ import { parsePlexScrobble, parsePulsarr } from '../src/routes/parse.js'
 
 const PLEX = {
   event: 'media.scrobble', user: true, owner: true,
-  Account: { id: 5194, title: 'plexuser' },
+  Account: { id: 5194, title: 'testuser' },
   Metadata: {
     type: 'episode', ratingKey: '90366', grandparentRatingKey: '90363',
     title: 'Sales Contest', grandparentTitle: 'Tires', parentIndex: 1, index: 3,
@@ -15,7 +15,7 @@ const PLEX = {
 const PULSARR = {
   event: 'watchlist.added', timestamp: '2026-09-16T10:14:45.738Z',
   data: {
-    addedBy: { userId: 1, username: 'plexuser' },
+    addedBy: { userId: 1, username: 'testuser' },
     content: { title: 'The Mentalist', type: 'show', key: '5d9c08353c3f87001f34a531',
                guids: ['imdb:tt1196946', 'tmdb:5920', 'tvdb:82459'] },
   },
@@ -30,7 +30,7 @@ function form(payload: unknown) {
 describe('parsePlexScrobble', () => {
   it('extracts the fields we act on from the multipart payload part', () => {
     const p = parsePlexScrobble(form(PLEX))!
-    expect(p.user).toBe('plexuser')
+    expect(p.user).toBe('testuser')
     expect(p.type).toBe('episode')
     expect(p.showRatingKey).toBe('90363')
     expect(p.grandparentTitle).toBe('Tires')
@@ -79,7 +79,7 @@ describe('parsePlexScrobble', () => {
 describe('parsePulsarr', () => {
   it('parses added, normalising colon-form guids to scheme://id', () => {
     const p = parsePulsarr(PULSARR)!
-    expect(p.user).toBe('plexuser')
+    expect(p.user).toBe('testuser')
     expect(p.action).toBe('added')
     expect(p.kind).toBe('show')
     expect(p.guids).toEqual([{ id: 'imdb://tt1196946' }, { id: 'tmdb://5920' }, { id: 'tvdb://82459' }])

@@ -14,7 +14,7 @@
 
 - **Never write on an unverified match.** A Bingers title is only accepted when its `external_ids` intersect the incoming tmdb/tvdb/imdb IDs. No title-similarity fallback.
 - **`DRY_RUN` defaults to `true`.** Every write path logs the intended request and returns without sending until explicitly disabled.
-- **Only user `plexuser`.** Plex: `Account.title`. Pulsarr: `data.addedBy.username`. Anything else is ignored with HTTP 200.
+- **Only user `<your-plex-username>`.** Plex: `Account.title`. Pulsarr: `data.addedBy.username`. Anything else is ignored with HTTP 200.
 - **Unresolvable events return HTTP 200**, are recorded in `failures`, and notify. Only transient errors retry.
 - Bingers writes carry exactly `Cookie: __Secure-better-auth.session_token=<token>`. No CSRF token exists.
 - Verified op shapes, to be used literally:
@@ -105,7 +105,7 @@ describe('loadConfig', () => {
   it('applies documented defaults', () => {
     const c = loadConfig(base as NodeJS.ProcessEnv)
     expect(c.dryRun).toBe(true)
-    expect(c.allowedUser).toBe('plexuser')
+    expect(c.allowedUser).toBe('<your-plex-username>')
     expect(c.port).toBe(8787)
     expect(c.catalogTtlHours).toBe(24)
     expect(c.searchMaxPages).toBe(3)
@@ -141,7 +141,7 @@ const Schema = z.object({
   BINGERS_USER_AGENT: z.string().default('Bingers/55 CFNetwork/3896.100.1.2.1 Darwin/27.0.0'),
   PLEX_URL: z.string().min(1),
   PLEX_TOKEN: z.string().min(1),
-  ALLOWED_USER: z.string().default('plexuser'),
+  ALLOWED_USER: z.string().default('<your-plex-username>'),
   DRY_RUN: z.string().default('true'),
   PORT: z.coerce.number().default(8787),
   DB_PATH: z.string().default('/data/bingers-sync.db'),
@@ -182,7 +182,7 @@ export function loadConfig(env: NodeJS.ProcessEnv) {
 BINGERS_SESSION_COOKIE=
 PLEX_URL=http://plex.local:32400
 PLEX_TOKEN=
-ALLOWED_USER=plexuser
+ALLOWED_USER=<your-plex-username>
 DRY_RUN=true
 PORT=8787
 DB_PATH=/data/bingers-sync.db
@@ -1709,7 +1709,7 @@ import { parsePlexScrobble, parsePulsarr } from '../src/routes/parse.js'
 
 const PLEX = {
   event: 'media.scrobble', user: true, owner: true,
-  Account: { id: 5194, title: 'plexuser' },
+  Account: { id: 5194, title: '<your-plex-username>' },
   Metadata: {
     type: 'episode', ratingKey: '90366', grandparentRatingKey: '90363',
     title: 'Sales Contest', grandparentTitle: 'Tires', parentIndex: 1, index: 3,
@@ -1721,7 +1721,7 @@ const PLEX = {
 const PULSARR = {
   event: 'watchlist.added', timestamp: '2026-09-16T10:14:45.738Z',
   data: {
-    addedBy: { userId: 1, username: 'plexuser' },
+    addedBy: { userId: 1, username: '<your-plex-username>' },
     content: { title: 'The Mentalist', type: 'show', key: '5d9c08353c3f87001f34a531',
                guids: ['imdb:tt1196946', 'tmdb:5920', 'tvdb:82459'] },
   },
@@ -1736,7 +1736,7 @@ function form(payload: unknown) {
 describe('parsePlexScrobble', () => {
   it('extracts the fields we act on from the multipart payload part', () => {
     const p = parsePlexScrobble(form(PLEX))!
-    expect(p.user).toBe('plexuser')
+    expect(p.user).toBe('<your-plex-username>')
     expect(p.type).toBe('episode')
     expect(p.showRatingKey).toBe('90363')
     expect(p.grandparentTitle).toBe('Tires')
@@ -1767,7 +1767,7 @@ describe('parsePlexScrobble', () => {
 describe('parsePulsarr', () => {
   it('parses added, normalising colon-form guids to scheme://id', () => {
     const p = parsePulsarr(PULSARR)!
-    expect(p.user).toBe('plexuser')
+    expect(p.user).toBe('<your-plex-username>')
     expect(p.action).toBe('added')
     expect(p.kind).toBe('show')
     expect(p.guids).toEqual([{ id: 'imdb://tt1196946' }, { id: 'tmdb://5920' }, { id: 'tvdb://82459' }])
@@ -1917,7 +1917,7 @@ function router(routes: [RegExp, unknown][]) {
 }
 
 const SCROBBLE = {
-  user: 'plexuser', type: 'episode' as const, showRatingKey: '90363',
+  user: '<your-plex-username>', type: 'episode' as const, showRatingKey: '90363',
   guids: [{ id: 'tmdb://5175711' }], grandparentTitle: 'Tires', title: 'Sales Contest',
   year: 2024, season: 1, number: 3, viewCount: 1, lastViewedAt: 1789553428,
 }
@@ -1997,7 +1997,7 @@ describe('handlePulsarr', () => {
       [/sync\/push/, { results: [], rows: {} }],
     ])
     const r = await handlePulsarr(deps(f), {
-      user: 'plexuser', action: 'added', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
+      user: '<your-plex-username>', action: 'added', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
     })
     expect(r.status).toBe('ok')
     const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
@@ -2008,7 +2008,7 @@ describe('handlePulsarr', () => {
     store.putTitleMapping([{ source: 'tmdb', extId: '5920', kind: 'show', titleId: 'M1', title: null, year: null }])
     const { f, calls } = router([[/sync\/push/, { results: [], rows: {} }]])
     await handlePulsarr(deps(f), {
-      user: 'plexuser', action: 'removed', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
+      user: '<your-plex-username>', action: 'removed', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
     })
     const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
     expect(ops[0].deleted).toBe(true)
@@ -2649,7 +2649,7 @@ Expected: `{"ok":true,"dryRun":true,...}` and a non-null `sessionDaysRemaining`.
 
 ```bash
 curl -s -X POST localhost:8787/plex \
-  -F 'payload={"event":"media.scrobble","Account":{"title":"plexuser"},"Metadata":{"type":"episode","grandparentRatingKey":"90363","grandparentTitle":"Tires","title":"Sales Contest","parentIndex":1,"index":3,"year":2024,"viewCount":1,"lastViewedAt":1789553428,"Guid":[{"id":"tmdb://5175711"}]}}'
+  -F 'payload={"event":"media.scrobble","Account":{"title":"<your-plex-username>"},"Metadata":{"type":"episode","grandparentRatingKey":"90363","grandparentTitle":"Tires","title":"Sales Contest","parentIndex":1,"index":3,"year":2024,"viewCount":1,"lastViewedAt":1789553428,"Guid":[{"id":"tmdb://5175711"}]}}'
 docker compose logs --tail=50 bingers-sync
 ```
 

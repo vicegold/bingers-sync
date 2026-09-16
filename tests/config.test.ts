@@ -5,13 +5,13 @@ const base = {
   BINGERS_SESSION_COOKIE: 'tok',
   PLEX_URL: 'http://plex.local:32400',
   PLEX_TOKEN: 'plex',
+  ALLOWED_USER: 'testuser',
 }
 
 describe('loadConfig', () => {
   it('applies documented defaults', () => {
     const c = loadConfig(base as NodeJS.ProcessEnv)
     expect(c.dryRun).toBe(true)
-    expect(c.allowedUser).toBe('plexuser')
     expect(c.port).toBe(8787)
     expect(c.catalogTtlHours).toBe(24)
     expect(c.searchMaxPages).toBe(3)
@@ -36,6 +36,12 @@ describe('loadConfig', () => {
     expect(loadConfig({ ...base, DRY_RUN: 'false' } as NodeJS.ProcessEnv).dryRun).toBe(false)
     expect(loadConfig({ ...base, DRY_RUN: '0' } as NodeJS.ProcessEnv).dryRun).toBe(true)
     expect(loadConfig({ ...base, DRY_RUN: 'FALSE' } as NodeJS.ProcessEnv).dryRun).toBe(true)
+  })
+
+  it('requires ALLOWED_USER — no identity is baked into the code', () => {
+    const { ALLOWED_USER, ...without } = base as Record<string, string>
+    expect(() => loadConfig(without as NodeJS.ProcessEnv)).toThrow()
+    expect(loadConfig(base as NodeJS.ProcessEnv).allowedUser).toBe('testuser')
   })
 
   it('throws when a required secret is missing', () => {

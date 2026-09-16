@@ -3,25 +3,57 @@ services:
         image: ghcr.io/vicegold/bingers-sync:latest
         restart: unless-stopped
         environment:
-            # secrets come from .env, everything else is set here
+            # --- required -------------------------------------------------
+            # Bingers session token, captured from the app's traffic
+            # (__Secure-better-auth.session_token). The only write credential;
+            # it cannot be minted programmatically.
             - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE}
+            # Plex Media Server base URL. Use the LAN IP — container DNS will
+            # not resolve .local names.
             - PLEX_URL=${PLEX_URL}
+            # Plex API token, used to look up show GUIDs and per-episode watch state.
             - PLEX_TOKEN=${PLEX_TOKEN}
-            - DRY_RUN=true
-            - ALLOWED_USER=plexuser
-            - PORT=8787
-            - DB_PATH=/data/bingers-sync.db
-            - NOTIFY_URL=
-            - CATALOG_TTL_HOURS=24
-            - PLEX_ALLLEAVES_TTL_MIN=60
-            - SYNC_PULL_INTERVAL_MIN=30
-            - WATCH_DATE_TOLERANCE_SEC=120
-            - SEARCH_MAX_PAGES=3
+            # Whose activity to sync. Matched against Plex Account.title and
+            # Pulsarr data.addedBy.username; anything else is logged and ignored.
+            - ALLOWED_USER=${ALLOWED_USER}
+
+            # --- optional, shown with their defaults ----------------------
+            # Log intended writes without sending them. Disabled ONLY by the
+            # exact string "false", so a typo can never enable writes.
+            # - DRY_RUN=true
+            # Port the service listens on.
+            # - PORT=8787
+            # SQLite file. Must stay under /data (the bind mount below) or the
+            # outbox will not survive a restart.
+            # - DB_PATH=/data/bingers-sync.db
+            # Webhook posted to on unresolvable events and write-halts.
+            # Unset means failures are only visible in the log and /health.
+            # - NOTIFY_URL=
+            # How long a title's cached versions.json is trusted before a
+            # proactive re-check. A cache MISS re-checks regardless, so a newly
+            # aired episode never waits this out.
+            # - CATALOG_TTL_HOURS=24
+            # Minimum gap between /allLeaves backfill scans of the same show.
+            # Inside the window a scrobble still writes its own episode; only
+            # the backfill scan is skipped.
+            # - PLEX_ALLLEAVES_TTL_MIN=60
+            # How often the local mirror of follows/entries refreshes. A stale
+            # mirror suppresses backfill (never the scrobble itself).
+            # - SYNC_PULL_INTERVAL_MIN=30
+            # Skip the date-correction PATCH when the server's own timestamp is
+            # already within this many seconds of the real watch time.
+            # - WATCH_DATE_TOLERANCE_SEC=120
+            # Search pages scanned before a title is declared unresolvable.
+            # - SEARCH_MAX_PAGES=3
+            # User-Agent sent to api.bingers.app. Defaults to the real app's.
+            # - BINGERS_USER_AGENT=
         volumes:
             - ./data:/data
         ports:
             - 8787:8787
 
+    # Build from the working tree instead of pulling:
+    #   docker compose --profile dev up -d --build bingers-sync-dev
     bingers-sync-dev:
         profiles:
             - dev
@@ -31,16 +63,7 @@ services:
             - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE}
             - PLEX_URL=${PLEX_URL}
             - PLEX_TOKEN=${PLEX_TOKEN}
-            - DRY_RUN=true
-            - ALLOWED_USER=plexuser
-            - PORT=8787
-            - DB_PATH=/data/bingers-sync.db
-            - NOTIFY_URL=
-            - CATALOG_TTL_HOURS=24
-            - PLEX_ALLLEAVES_TTL_MIN=60
-            - SYNC_PULL_INTERVAL_MIN=30
-            - WATCH_DATE_TOLERANCE_SEC=120
-            - SEARCH_MAX_PAGES=3
+            - ALLOWED_USER=${ALLOWED_USER}
         volumes:
             - ./data:/data
         ports:

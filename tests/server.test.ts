@@ -9,7 +9,7 @@ let store: Store
 beforeEach(() => { store = openStore(':memory:') })
 
 const CONFIG = loadConfig({
-  BINGERS_SESSION_COOKIE: 'TOK', PLEX_URL: 'http://plex', PLEX_TOKEN: 'pt',
+  BINGERS_SESSION_COOKIE: 'TOK', PLEX_URL: 'http://plex', PLEX_TOKEN: 'pt', ALLOWED_USER: 'testuser',
 } as NodeJS.ProcessEnv) // DRY_RUN defaults true
 
 const app = () => createApp({
@@ -76,12 +76,12 @@ describe('routes', () => {
 // is what's under test here.
 const plexPayload = () => JSON.stringify({
   event: 'media.scrobble',
-  Account: { title: 'plexuser' },
+  Account: { title: 'testuser' },
   Metadata: { type: 'movie', title: 'Some Movie', Guid: [{ id: 'tmdb://123' }], viewCount: 1, lastViewedAt: 1700000000 },
 })
 const pulsarrPayload = () => JSON.stringify({
   event: 'watchlist.added',
-  data: { addedBy: { username: 'plexuser' }, content: { title: 'Some Show', type: 'show', guids: ['tmdb:123'] } },
+  data: { addedBy: { username: 'testuser' }, content: { title: 'Some Show', type: 'show', guids: ['tmdb:123'] } },
 })
 
 describe('routes stay 200 when the handler or the store itself fails', () => {

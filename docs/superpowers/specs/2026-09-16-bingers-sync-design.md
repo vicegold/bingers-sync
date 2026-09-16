@@ -12,7 +12,7 @@ local network:
 - **Plex** `media.scrobble` → mark the episode or movie watched on Bingers
 - **Pulsarr** `watchlist.added` / `watchlist.removed` → follow / unfollow on Bingers
 
-Both are filtered to the single user `plexuser`. Everything else is ignored.
+Both are filtered to the single user `<your-plex-username>`. Everything else is ignored.
 
 ## Constraints
 
@@ -273,7 +273,7 @@ HTTP with no public exposure.
 
 ```
 Plex ──multipart/form-data──┐
-                            ├─→ filter(plexuser) ─→ resolve() ─→ plan() ─→ push()
+                            ├─→ filter(<your-plex-username>) ─→ resolve() ─→ plan() ─→ push()
 Pulsarr ──application/json──┘         │                │                    │
                                       │                │                    ↓
                                       │                └── SQLite ──→ api.bingers.app
@@ -435,7 +435,7 @@ is also found later via TVDB or IMDb without re-searching.
 ### Plex `media.scrobble`
 
 Plex posts `multipart/form-data` with the JSON in a `payload` part — not a JSON
-body. Accepted only when `Account.title === "plexuser"`.
+body. Accepted only when `Account.title === "<your-plex-username>"`.
 
 1. Resolve show (episodes) or movie IDs as above.
 2. If the title is not currently followed, emit a `follows` op first — the same
@@ -494,7 +494,7 @@ show you watch weekly is no extra Plex calls at all.
 
 ### Pulsarr `watchlist.added` / `watchlist.removed`
 
-JSON body. Accepted only when `data.addedBy.username === "plexuser"`.
+JSON body. Accepted only when `data.addedBy.username === "<your-plex-username>"`.
 
 - `added` → `follows` op with `fields: { kind, forLater: false, stopped: false,
   watchlistHidden: false }` (verified shape)
@@ -573,7 +573,7 @@ the session, so this is a possible refinement, not a dependency.
 BINGERS_SESSION_COOKIE=    # __Secure-better-auth.session_token value
 PLEX_URL=                  # http://plex.local:32400
 PLEX_TOKEN=
-ALLOWED_USER=plexuser      # Plex Account.title and Pulsarr addedBy.username
+ALLOWED_USER=<your-plex-username>      # Plex Account.title and Pulsarr addedBy.username
 DRY_RUN=true               # default; log intended pushes without sending
 PORT=8787
 DB_PATH=/data/bingers-sync.db
@@ -597,7 +597,7 @@ NOTIFY_URL=                # webhook for failure notifications
   special with `viewCount > 0` is included; an episode Plex has never played is
   not written even when later episodes were.
 - **Webhook parsing** — Plex multipart with a real captured body; Pulsarr JSON;
-  both rejected for a user other than `plexuser`.
+  both rejected for a user other than `<your-plex-username>`.
 - **Auth** — cookie rotation is persisted; 401 halts writes without dropping
   queued ops.
 - Bingers HTTP is stubbed in tests. No test touches the live API.

@@ -12,7 +12,7 @@ let store: Store
 beforeEach(() => { store = openStore(':memory:') })
 
 const CONFIG = loadConfig({
-  BINGERS_SESSION_COOKIE: 'TOK', PLEX_URL: 'http://plex', PLEX_TOKEN: 'pt', DRY_RUN: 'false',
+  BINGERS_SESSION_COOKIE: 'TOK', PLEX_URL: 'http://plex', PLEX_TOKEN: 'pt', ALLOWED_USER: 'testuser', DRY_RUN: 'false',
 } as NodeJS.ProcessEnv)
 
 let n = 0
@@ -45,7 +45,7 @@ const pushEcho = (init: any) => ({
 })
 
 const SCROBBLE = {
-  user: 'plexuser', type: 'episode' as const, showRatingKey: '90363',
+  user: 'testuser', type: 'episode' as const, showRatingKey: '90363',
   guids: [{ id: 'tmdb://5175711' }], grandparentTitle: 'Tires', title: 'Sales Contest',
   year: 2024, season: 1, number: 3, viewCount: 1, lastViewedAt: 1789553428,
 }
@@ -388,7 +388,7 @@ describe('handlePulsarr', () => {
       [/sync\/push/, pushEcho],
     ])
     const r = await handlePulsarr(deps(f), {
-      user: 'plexuser', action: 'added', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
+      user: 'testuser', action: 'added', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
     })
     expect(r.status).toBe('ok')
     const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
@@ -399,7 +399,7 @@ describe('handlePulsarr', () => {
     store.putTitleMapping([{ source: 'tmdb', extId: '5920', kind: 'show', titleId: 'M1', title: null, year: null }])
     const { f, calls } = router([[/sync\/push/, pushEcho]])
     await handlePulsarr(deps(f), {
-      user: 'plexuser', action: 'removed', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
+      user: 'testuser', action: 'removed', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
     })
     const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
     expect(ops[0].deleted).toBe(true)

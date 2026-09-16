@@ -5,7 +5,7 @@ const Schema = z.object({
   BINGERS_USER_AGENT: z.string().default('Bingers/55 CFNetwork/3896.100.1.2.1 Darwin/27.0.0'),
   PLEX_URL: z.string().min(1),
   PLEX_TOKEN: z.string().min(1),
-  ALLOWED_USER: z.string().default('plexuser'),
+  ALLOWED_USER: z.string().min(1),
   DRY_RUN: z.string().default('true'),
   PORT: z.coerce.number().default(8787),
   DB_PATH: z.string().default('/data/bingers-sync.db'),
