@@ -112,6 +112,33 @@ server stamps the times.**
   "fields": { "watched": true, "plays": 1, "batchId": null } }
 ```
 
+### Batches — verified
+
+Capture 4 is the app's own "mark previous episodes as watched" flow. It sends
+**one** `sync/push` containing N `entries` ops that share a single
+client-generated `batchId`:
+
+```jsonc
+{ "clientBatchId": "f8d4617b-…",          // per-request, idempotency
+  "ops": [
+    { "opId": "7cf7e9de-…", "table": "entries",
+      "pk": { "entityKind": "episode", "entityId": "019f6bb8-02e7-7361-…" },
+      "fields": { "watched": true, "plays": 1,
+                  "batchId": "278c0da3-…" } },   // shared across the group
+    { "opId": "e3f0678b-…", … "batchId": "278c0da3-…" },
+    { "opId": "e755100d-…", … "batchId": "278c0da3-…" }
+  ] }
+```
+
+The two IDs are distinct in purpose: `clientBatchId` scopes the HTTP request,
+`batchId` is a semantic grouping persisted on every resulting row. All ops
+returned `status: "applied"`, and all three rows came back stamped with the
+*same* `firstWatchedAt`. Op order in the array does not matter — the captured
+ops were E5, E7, E6.
+
+The app sends no `PATCH` after a batch, so its own catch-up leaves every episode
+dated to the moment you tapped the button.
+
 Note what is *absent*: no `followedAt`, no `firstWatchedAt`, no `lastWatchedAt`.
 The `sync/push` response for the entries op returns the stored row with
 `firstWatchedAt` and `lastWatchedAt` both set to server receipt time. The push
@@ -189,7 +216,9 @@ action. Out-of-band delivery to the app is APNs push via Expo, registered with
 | `entityKind: "movie"` exists in entries | **verified** — seen in an entries cursor |
 | Movie `entityId` = titleId | **assumed** |
 | Unfollow shape (likely `fields: { deleted: true }`) | **assumed** |
+| Batched entries ops sharing a `batchId` | **verified** — observed in capture 4 |
 | `POST /me/watches` for one-step dated writes | **untested** — probe once |
+| `GET /me/watches?batchId=` for bulk read-back | **untested** — probe once |
 | Session `expiresAt` slides forward on use | **assumed** — see Auth |
 
 The remaining assumed write shapes are why the service ships with `DRY_RUN=true`.
@@ -395,7 +424,13 @@ For each episode where `viewCount > 0`:
 - **skip it if `sync_state` already has it watched on Bingers** — backfill only
   ever writes episodes Bingers does not already know about
 - emit an `entries` op with that episode's own `viewCount` as `plays`
+- tag every op in the run with one shared `batchId`, matching the app's own
+  catch-up flow, so Bingers groups it as a single action
 - correct its date to that episode's own `lastViewedAt` in step 6
+
+All ops go in **one** `sync/push`, as the app does. This service then goes one
+step further than the app, which leaves batch-marked episodes dated to the moment
+you tapped the button: each entry is dated to its real Plex watch time.
 
 Because every backfilled watch now carries a genuine Plex timestamp, there is no
 invented date and no `BACKFILL_DATE_MODE` policy to choose.
