@@ -7,16 +7,42 @@ Mirrors Plex scrobbles and Pulsarr watchlist changes into Bingers.
 1. `cp .env.example .env` and fill in `BINGERS_SESSION_COOKIE`, `PLEX_URL`, `PLEX_TOKEN`.
    The cookie is the `__Secure-better-auth.session_token` value, obtained by
    capturing the Bingers app's traffic with a TLS proxy.
-2. `docker compose up -d --build`
-3. Point Plex at `http://<host>:8787/plex` (Settings → Webhooks) and Pulsarr at
-   `http://<host>:8787/pulsarr`.
+2. Log in to the registry once (the package is private):
+   `echo <PAT-with-read:packages> | docker login ghcr.io -u vicegold --password-stdin`
+3. `docker compose up -d` — pulls `ghcr.io/vicegold/bingers-sync:latest`, published
+   by CI on every push to main. To build from source instead:
+   `docker compose --profile dev up -d --build bingers-sync-dev`
+4. Point Plex and Pulsarr at the service. Use the host's **IP**, not a hostname:
+
+   | Webhook | URL |
+   |---|---|
+   | Plex (app.plex.tv → Settings → Webhooks, needs Plex Pass) | `http://<host-ip>:8787/plex` |
+   | Pulsarr | `http://<host-ip>:8787/pulsarr` |
+
+   Plex has no per-event filter and sends all ~12 event types; everything except
+   `media.scrobble` is logged and discarded. Do not use `localhost` even when
+   everything is on one box — if Plex or Pulsarr runs in Docker, `localhost` is
+   that container, not the host.
+
+### Running it off-host (e.g. from a Mac)
+
+The service must reach Plex's API outbound. On macOS 15+, Local Network privacy
+blocks LAN access per-process: `curl` is Apple-signed and exempt, but Node is
+not, so the Plex lookup fails with `EHOSTUNREACH` while `curl` to the same
+address succeeds. Grant Local Network access to the terminal app, or run the
+service on the same host as Plex.
 
 `DRY_RUN=true` is the default: every intended write is logged and nothing is sent.
 Verify the log looks right, then set `DRY_RUN=false` and restart.
 
 ## Operating
 
-- `GET /health` — dry-run state, days left on the session, whether failures exist.
+- `GET /health` — dry-run state, days left on the session, whether writes are
+  halted, outbox depth, and mirror freshness (`backfillEnabled` is false when the
+  local mirror is stale, which suppresses backfill but not the scrobble itself).
+- Every inbound webhook is logged with its event type, account and outcome —
+  including ones that are ignored, so "nothing happened" is distinguishable from
+  "never arrived".
 - Unresolvable events land in the `failures` table with their payload, and still
   return HTTP 200 so Plex does not retry them.
 - The session cannot be refreshed programmatically. If `sessionDaysRemaining`
