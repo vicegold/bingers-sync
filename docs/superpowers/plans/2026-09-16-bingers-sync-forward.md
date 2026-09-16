@@ -1452,6 +1452,17 @@ git commit -m "feat: bingers auth with cookie rotation and expiry heartbeat"
 
 ### Task 9: Bingers sync client — push, pull, dated writes
 
+> **CORRECTION (post-execution).** The code block below as originally written
+> contained a Critical defect and four Important ones, all found in review and
+> fixed in commit `4eeddac`. If you re-run this plan, take the corrected
+> implementation from that commit, not from this task's code block:
+> `applyDates` must select the watch record by VALUE (greatest `Date.parse`),
+> never by position — on a rewatch, positional selection can PATCH the oldest
+> historical watch and leave the new one wrongly stamped. It must also guard
+> `Date.parse` NaN (which otherwise fails open toward writing), rethrow on 401
+> from both the GET and PATCH paths, `recordFailure` on non-401 failures, and
+> `pullOnce` must persist cursors only for the streams it actually stores.
+
 **Files:**
 - Create: `src/bingers/sync.ts`
 - Test: `tests/bingers-sync.test.ts`
