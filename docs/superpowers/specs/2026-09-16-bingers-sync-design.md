@@ -369,24 +369,45 @@ body. Accepted only when `Account.title === "plexuser"`.
 1. Resolve show (episodes) or movie IDs as above.
 2. If the title is not in `follows`, emit a `follows` op first.
 3. Emit an `entries` op: `entityKind: "episode"` with the resolved `episodeId`, or
-   `entityKind: "movie"` with the `titleId`.
-4. Backfill: emit `entries` ops for every episode ordered before the scrobbled one
-   that is not already watched.
-5. Push as one batch.
+   `entityKind: "movie"` with the `titleId`. `plays` = `Metadata.viewCount` or 1.
+4. Backfill (episodes only) — see below.
+5. Push every op as one batch.
+6. Date correction: for each entry written, `GET /me/watches` and `PATCH` the
+   record to that episode's own real watch time.
 
-`plays` uses `Metadata.viewCount` when present, else 1.
+Step 6 is skipped for any entry whose corrected time is already within
+`WATCH_DATE_TOLERANCE_SEC` of the server stamp, so a live scrobble stays at one
+request.
 
-5. Date correction: for each entry just written, `GET /me/watches` and `PATCH` the
-   record to the real watch time. The scrobbled episode uses Plex's
-   `lastViewedAt`; backfilled episodes use `BACKFILL_DATE_MODE`.
+### Backfill
 
-Step 5 is skipped when the corrected time would equal the server stamp anyway
-(a live scrobble arriving within `WATCH_DATE_TOLERANCE_SEC`), so the common case
-stays at one request.
+Backfill mirrors Plex's actual watch history rather than inferring one from
+position. Plex already knows when each episode was watched and how often:
 
-**Backfill excludes season 0.** Specials appear in `requiredSeasons` and would
-otherwise be swept up by watching a later regular episode. Ordering is by
-`(season, number)` over seasons ≥ 1.
+```
+GET {PLEX_URL}/library/metadata/{grandparentRatingKey}/allLeaves   (X-Plex-Token)
+→ every episode of the show with parentIndex, index, viewCount, lastViewedAt
+```
+
+For each episode where `viewCount > 0`:
+
+- map `(parentIndex, index)` → `episodeId` via `episode_map` (cached, no catalog I/O)
+- **skip it if `sync_state` already has it watched on Bingers** — backfill only
+  ever writes episodes Bingers does not already know about
+- emit an `entries` op with that episode's own `viewCount` as `plays`
+- correct its date to that episode's own `lastViewedAt` in step 6
+
+Because every backfilled watch now carries a genuine Plex timestamp, there is no
+invented date and no `BACKFILL_DATE_MODE` policy to choose.
+
+**Season 0 is no longer excluded.** That exclusion existed only because the
+earlier design inferred watches by position, where sweeping up specials would
+have been wrong. Mirroring real Plex view state removes the problem: a special is
+written if and only if Plex recorded you watching it.
+
+`allLeaves` is fetched at most once per show per `PLEX_ALLLEAVES_TTL_MIN`, and
+skipped entirely for shows already fully reconciled, so the steady state for a
+show you watch weekly is no extra Plex calls at all.
 
 ### Pulsarr `watchlist.added` / `watchlist.removed`
 
@@ -475,8 +496,8 @@ DRY_RUN=true               # default; log intended pushes without sending
 PORT=8787
 DB_PATH=/data/bingers-sync.db
 CATALOG_TTL_HOURS=24
-BACKFILL_DATE_MODE=scrobble  # scrobble | server  — date applied to backfilled episodes
 WATCH_DATE_TOLERANCE_SEC=120 # skip the PATCH when server stamp is already close enough
+PLEX_ALLLEAVES_TTL_MIN=60    # how often a show's Plex watch state may be re-read
 SEARCH_MAX_PAGES=3         # search/titles pages scanned before declaring failure
 SYNC_PULL_INTERVAL_MIN=30  # refresh of the local follows/entries mirror
 NOTIFY_URL=                # webhook for failure notifications
@@ -487,9 +508,12 @@ NOTIFY_URL=                # webhook for failure notifications
 - **resolve.ts** — fixtures from both real captures plus the two reference
   payloads. Cases: exact ID match; multiple candidates where only one intersects;
   zero intersection → failure; cache hit avoids all network calls.
-- **plan.ts** — pure function, no I/O. Cases: unfollowed show emits follow first;
-  backfill spans seasons and **excludes season 0**; already-watched episode
-  produces no duplicate; movie produces `entityKind: "movie"`.
+- **plan.ts** — pure function over (event, Plex watch state, sync_state), no I/O.
+  Cases: unfollowed show emits follow first; backfill emits only episodes Plex
+  marks watched; an episode already watched on Bingers is never re-written; each
+  backfilled op carries that episode's own `lastViewedAt` and `viewCount`; a Plex
+  special with `viewCount > 0` is included; an episode Plex has never played is
+  not written even when later episodes were.
 - **Webhook parsing** — Plex multipart with a real captured body; Pulsarr JSON;
   both rejected for a user other than `plexuser`.
 - **Auth** — cookie rotation is persisted; 401 halts writes without dropping
