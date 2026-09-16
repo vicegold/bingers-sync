@@ -16,6 +16,20 @@ describe('loadConfig', () => {
     expect(c.catalogTtlHours).toBe(24)
     expect(c.searchMaxPages).toBe(3)
     expect(c.watchDateToleranceSec).toBe(120)
+    expect(c.syncPullIntervalMin).toBe(30)
+    expect(c.plexAllLeavesTtlMin).toBe(60)
+    expect(c.dbPath).toBe('/data/bingers-sync.db')
+    expect(c.notifyUrl).toBeNull()
+    expect(c.bingersUserAgent).toBe('Bingers/55 CFNetwork/3896.100.1.2.1 Darwin/27.0.0')
+  })
+
+  it('strips trailing slashes from PLEX_URL', () => {
+    expect(loadConfig({ ...base, PLEX_URL: 'http://plex.local:32400/' } as NodeJS.ProcessEnv).plexUrl).toBe(
+      'http://plex.local:32400',
+    )
+    expect(loadConfig({ ...base, PLEX_URL: 'http://plex.local:32400///' } as NodeJS.ProcessEnv).plexUrl).toBe(
+      'http://plex.local:32400',
+    )
   })
 
   it('only disables dry run for the exact string "false"', () => {

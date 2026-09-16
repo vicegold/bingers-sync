@@ -169,7 +169,9 @@ export function openStore(dbPath: string) {
       return db.prepare('SELECT * FROM failures ORDER BY id DESC LIMIT ?').all(limit) as FailureRow[]
     },
     getAuthState(): AuthState | null {
-      const r = db.prepare('SELECT cookie, expires_at, rotated_at, checked_at FROM auth_state WHERE id=1').get() as any
+      const r = db.prepare('SELECT cookie, expires_at, rotated_at, checked_at FROM auth_state WHERE id=1').get() as
+        | { cookie: string; expires_at: string | null; rotated_at: string | null; checked_at: string | null }
+        | undefined
       return r ? { cookie: r.cookie, expiresAt: r.expires_at, rotatedAt: r.rotated_at, checkedAt: r.checked_at } : null
     },
     putAuthState(s: AuthState) {

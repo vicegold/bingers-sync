@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -105,6 +105,24 @@ describe('catalog_version', () => {
     const result = s.getCatalogVersion('T1')
     expect(result!.files).toEqual(files2)
   })
+
+  it('advances fetched_at on a repeated write', () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-09-16T10:00:00.000Z'))
+      s.putCatalogVersion('T1', { 'file1.mkv': { size: 1024 } })
+      const first = s.getCatalogVersion('T1')!.fetchedAt
+
+      vi.setSystemTime(new Date('2026-09-16T11:00:00.000Z'))
+      s.putCatalogVersion('T1', { 'file2.mkv': { size: 2048 } })
+      const second = s.getCatalogVersion('T1')!.fetchedAt
+
+      expect(second).not.toBe(first)
+      expect(new Date(second).getTime()).toBeGreaterThan(new Date(first).getTime())
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe('auth_state', () => {
@@ -161,6 +179,14 @@ describe('mirror freshness marker', () => {
     s.setCursor('entries', 'c1')
     s.markMirrorSynced('2026-09-16T10:00:00.000Z')
     expect(s.getCursor('entries')).toBe('c1')
+  })
+})
+
+describe('close', () => {
+  it('closes the underlying database connection', () => {
+    s.setCursor('follows', 'c1')
+    s.close()
+    expect(() => s.getCursor('follows')).toThrow()
   })
 })
 
