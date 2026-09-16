@@ -5,3 +5,7 @@ dist/
 data/
 *.db-wal
 *.db-shm
+
+# local working notes, not part of the project
+docs/
+.superpowers/

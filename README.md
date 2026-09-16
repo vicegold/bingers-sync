@@ -52,5 +52,3 @@ Verify the log looks right, then set `DRY_RUN=false` and restart.
   return HTTP 200 so Plex does not retry them.
 - The session cannot be refreshed programmatically. If `sessionDaysRemaining`
   starts falling toward zero, capture a fresh cookie and restart.
-
-See `docs/superpowers/specs/2026-09-16-bingers-sync-design.md` for the reverse-engineered protocol.
