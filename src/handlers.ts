@@ -47,6 +47,33 @@ export function mirrorFreshness(store: Store, syncPullIntervalMin: number): Mirr
   return { syncedAt, fresh: Date.now() - t <= maxAgeMin * 60_000, maxAgeMin }
 }
 
+/**
+ * Why the allLeaves backfill scan can be skipped for this show, or null to go
+ * ahead and fetch.
+ *
+ * This is a SEPARATE, ADDITIONAL reason to skip from the mirror-freshness
+ * guard, and is only ever consulted once that guard has already passed: a
+ * stale mirror must keep skipping backfill (and keep saying so out loud) no
+ * matter how long ago allLeaves was last fetched.
+ */
+export function allLeavesSkipReason(
+  store: Store, ratingKey: string, ttlMin: number, nowMs = Date.now(),
+): string | null {
+  const st = store.getAllLeavesState(ratingKey)
+  // Reconciled shows need no scan at all, and stay reconciled through a binge:
+  // every later plex watch arrives here as its own scrobble, which is written
+  // and mirrored optimistically, so bingers never falls behind plex again
+  // until something outside this service watches an episode.
+  if (st.reconciledAt) return `show already fully reconciled (${st.reconciledAt})`
+  if (st.fetchedAt) {
+    const t = Date.parse(st.fetchedAt)
+    if (Number.isFinite(t) && nowMs - t < Math.max(0, ttlMin) * 60_000) {
+      return `allLeaves fetched ${st.fetchedAt}, inside the ${ttlMin}m TTL`
+    }
+  }
+  return null
+}
+
 function syncDeps(d: AppDeps): SyncDeps {
   return {
     auth: d.auth, store: d.store, userAgent: d.config.bingersUserAgent,
@@ -129,20 +156,33 @@ export async function handlePlex(d: AppDeps, s: PlexScrobble): Promise<HandlerRe
       d.store.recordFailure('plex', 'backfill skipped: local mirror is not fresh'
         + ` (${mirror.syncedAt ? `last sync/pull succeeded ${mirror.syncedAt}` : 'sync/pull has never succeeded'},`
         + ` max age ${mirror.maxAgeMin}m) — the already-watched filter cannot be trusted`, s)
-    } else {
+    } else if (allLeavesSkipReason(d.store, s.showRatingKey!, d.config.plexAllLeavesTtlMin) == null) {
       try {
         const leaves = await fetchAllLeaves(pd, s.showRatingKey!)
+        // Only now, after the call really happened. Marking it before the
+        // await -- or in the catch -- would suppress the next TTL window on
+        // the strength of a request that never returned.
+        d.store.markAllLeavesFetched(s.showRatingKey!)
+        let reconciled = true
         for (const l of leaves) {
           if (!Number.isFinite(l.viewCount) || l.viewCount < 1) continue
+          const epId = d.store.getEpisodeId(t.titleId, l.season, l.number)
+          // "Fully reconciled" taken literally: every episode plex reports as
+          // watched is already watched on bingers. The scrobbled episode
+          // counts, because it is written by this very run. A leaf we cannot
+          // map, or one plex never dated, is NOT reconciled -- it is merely
+          // unwritable today, and a later catalog or plex fix may change that.
+          const settled = epId != null && (epId === entityId || alreadyWatched(d.store, 'episode', epId))
+          if (!settled) reconciled = false
           // No real Plex timestamp means no genuine date to write. The spec's
           // "there is no invented date" holds by excluding the leaf, not by
           // stamping it with now.
           if (l.lastViewedAt == null || !Number.isFinite(l.lastViewedAt)) continue
-          const epId = d.store.getEpisodeId(t.titleId, l.season, l.number)
           if (!epId || epId === entityId) continue
           if (alreadyWatched(d.store, 'episode', epId)) continue
           backfill.push({ episodeId: epId, plays: Math.max(1, Math.trunc(l.viewCount)), watchedAt: iso(l.lastViewedAt) })
         }
+        d.store.setAllLeavesReconciled(s.showRatingKey!, reconciled)
       } catch { /* backfill is best-effort; the scrobble itself still lands */ }
     }
   }

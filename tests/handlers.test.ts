@@ -288,6 +288,95 @@ describe('optimistic local mirror', () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// Task 15 -- PLEX_ALLLEAVES_TTL_MIN. The scrobbled episode is ALWAYS written;
+// only the backfill scan is rate limited.
+// ---------------------------------------------------------------------------
+const E2 = '019f6bb9-65fd-7ef3-8053-8e3333a9f111'
+const RK = '90363'
+const calledAllLeaves = (calls: { url: string }[]) => calls.some(c => /allLeaves/.test(c.url))
+
+describe('handlePlex allLeaves rate limit', () => {
+  it('makes no second allLeaves call inside the TTL, and still writes the scrobbled episode', async () => {
+    store.markMirrorSynced()
+    const first = router(ROUTES)
+    await handlePlex(deps(first.f), SCROBBLE)
+    expect(calledAllLeaves(first.calls)).toBe(true)
+
+    // Same show, seconds later: PLEX_ALLLEAVES_TTL_MIN defaults to 60.
+    const second = router(ROUTES)
+    const r = await handlePlex(deps(second.f), { ...SCROBBLE, number: 2, lastViewedAt: 1789553500 })
+    expect(r.status).toBe('ok')
+    expect(calledAllLeaves(second.calls)).toBe(false)
+    expect(entryIds(second.calls)).toEqual([E2]) // the scrobble itself still lands
+  })
+
+  it('fetches again once the TTL has elapsed', async () => {
+    store.markMirrorSynced()
+    const first = router(ROUTES)
+    await handlePlex(deps(first.f), SCROBBLE)
+    store.markAllLeavesFetched(RK, new Date(Date.now() - 61 * 60_000).toISOString())
+
+    const second = router(ROUTES)
+    await handlePlex(deps(second.f), { ...SCROBBLE, number: 2, lastViewedAt: 1789553500 })
+    expect(calledAllLeaves(second.calls)).toBe(true)
+  })
+
+  it('skips allLeaves for a fully reconciled show even long after the TTL has elapsed', async () => {
+    store.markMirrorSynced()
+    // E1 is the only other episode plex reports watched, and bingers already
+    // has it -- so after this run nothing plex knows is missing from bingers.
+    store.putSyncRows('entries', [{ pk: `episode:${BACKFILL_EP}`, row: { watched: true, deletedAt: null } }])
+    const first = router(ROUTES)
+    await handlePlex(deps(first.f), SCROBBLE)
+    expect(calledAllLeaves(first.calls)).toBe(true)
+    expect(store.getAllLeavesState(RK).reconciledAt).not.toBeNull()
+
+    // A day later: the TTL alone would happily permit another scan.
+    store.markAllLeavesFetched(RK, new Date(Date.now() - 24 * 60 * 60_000).toISOString())
+    const second = router(ROUTES)
+    await handlePlex(deps(second.f), { ...SCROBBLE, number: 2, lastViewedAt: 1789553500 })
+    expect(calledAllLeaves(second.calls)).toBe(false)
+    expect(entryIds(second.calls)).toEqual([E2])
+  })
+
+  it('does not call a show reconciled while plex reports a watch bingers has not got', async () => {
+    store.markMirrorSynced()
+    const { f } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE) // E1 is backfilled by THIS run, not already present
+    expect(store.getAllLeavesState(RK).reconciledAt).toBeNull()
+    expect(store.getAllLeavesState(RK).fetchedAt).not.toBeNull()
+  })
+
+  it('records no fetch marker when the allLeaves call itself failed, so the next scrobble retries', async () => {
+    store.markMirrorSynced()
+    const { f } = router(ROUTES)
+    const failing = vi.fn(async (url: string, init?: any) =>
+      /allLeaves/.test(url) ? new Response('nope', { status: 503 }) : f(url, init))
+    await handlePlex(deps(failing), SCROBBLE)
+    expect(store.getAllLeavesState(RK)).toEqual({ fetchedAt: null, reconciledAt: null })
+
+    const second = router(ROUTES)
+    await handlePlex(deps(second.f), { ...SCROBBLE, number: 2, lastViewedAt: 1789553500 })
+    expect(calledAllLeaves(second.calls)).toBe(true)
+  })
+
+  it('still skips backfill on a stale mirror even when the TTL would permit a fetch', async () => {
+    // allLeaves has never been fetched for this show, so the TTL imposes no
+    // skip of its own and would wave the scan straight through. The mirror
+    // guard is the only thing standing between this scrobble and a whole-show
+    // re-date, and it has to win -- and keep saying so out loud.
+    store.markMirrorSynced(new Date(Date.now() - 61 * 60_000).toISOString())
+    const { f, calls } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE)
+    expect(calledAllLeaves(calls)).toBe(false)
+    expect(entryIds(calls)).toEqual([SCROBBLED_EP])
+    expect(store.listFailures().some(x => /backfill skipped/.test(x.reason))).toBe(true)
+    // ...and nothing about the suppressed scan may be recorded as if it ran.
+    expect(store.getAllLeavesState(RK)).toEqual({ fetchedAt: null, reconciledAt: null })
+  })
+})
+
 describe('handlePulsarr', () => {
   it('follows on added using the verified titleId', async () => {
     const { f, calls } = router([

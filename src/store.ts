@@ -49,6 +49,16 @@ CREATE TABLE IF NOT EXISTS auth_state (
 // server stream name (follows/entries/catalog/prefs/settings).
 export const MIRROR_CURSOR = '__mirror_synced_at'
 
+// Per-show markers for the Plex allLeaves rate limit. Same reasoning as
+// MIRROR_CURSOR: `cursors` needs no migration, and the double-underscored
+// prefix cannot collide with a server stream name. Keyed by the PLEX show
+// ratingKey, because the thing being limited is a call to Plex addressed by
+// that key -- not by a Bingers titleId, which several Plex shows can share.
+export const allLeavesFetchedCursor = (ratingKey: string) => `__allleaves_at:${ratingKey}`
+export const allLeavesReconciledCursor = (ratingKey: string) => `__allleaves_done:${ratingKey}`
+
+export type AllLeavesState = { fetchedAt: string | null; reconciledAt: string | null }
+
 export function openStore(dbPath: string) {
   const db = new Database(dbPath)
   db.pragma('journal_mode = WAL')
@@ -127,6 +137,29 @@ export function openStore(dbPath: string) {
     markMirrorSynced(at?: string) {
       db.prepare('INSERT INTO cursors (name, value) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value')
         .run(MIRROR_CURSOR, at ?? now())
+    },
+
+    // When allLeaves was last actually fetched for a show, and whether the
+    // last scan left the show fully reconciled (nothing Plex reported watched
+    // was missing from Bingers). Both are read by the backfill rate limit;
+    // `fetchedAt` is only ever written after a fetch that really happened.
+    getAllLeavesState(ratingKey: string): AllLeavesState {
+      const st = db.prepare('SELECT value FROM cursors WHERE name=?')
+      const a = st.get(allLeavesFetchedCursor(ratingKey)) as { value: string } | undefined
+      const b = st.get(allLeavesReconciledCursor(ratingKey)) as { value: string } | undefined
+      return { fetchedAt: a?.value ?? null, reconciledAt: b?.value ?? null }
+    },
+    markAllLeavesFetched(ratingKey: string, at?: string) {
+      db.prepare('INSERT INTO cursors (name, value) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value')
+        .run(allLeavesFetchedCursor(ratingKey), at ?? now())
+    },
+    // `false` DELETES the marker: a show that has fallen out of reconciliation
+    // must look exactly like one that was never reconciled.
+    setAllLeavesReconciled(ratingKey: string, reconciled: boolean, at?: string) {
+      const name = allLeavesReconciledCursor(ratingKey)
+      if (!reconciled) { db.prepare('DELETE FROM cursors WHERE name=?').run(name); return }
+      db.prepare('INSERT INTO cursors (name, value) VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value')
+        .run(name, at ?? now())
     },
     recordFailure(source: string, reason: string, payload: unknown) {
       db.prepare('INSERT INTO failures (source, reason, payload, created_at) VALUES (?,?,?,?)')
