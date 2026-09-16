@@ -53,7 +53,10 @@ const SCROBBLE = {
 const ROUTES: [RegExp, Body][] = [
   [/library\/metadata\/90363\?includeGuids/, { MediaContainer: { Metadata: [{ Guid: [{ id: 'tmdb://247522' }] }] } }],
   [/allLeaves/, { MediaContainer: { Metadata: [
-    { parentIndex: 1, index: 1, viewCount: 1, lastViewedAt: 1788000000 },
+    // viewCount deliberately differs from SCROBBLE's (1): if the backfill op
+    // ever carried the scrobble's plays instead of this leaf's own, a test
+    // asserting plays===1 here would pass by coincidence and miss the bug.
+    { parentIndex: 1, index: 1, viewCount: 3, lastViewedAt: 1788000000 },
     { parentIndex: 1, index: 2 },
     { parentIndex: 1, index: 3, viewCount: 1, lastViewedAt: 1789553428 },
   ] } }],
@@ -97,12 +100,12 @@ describe('handlePlex', () => {
     expect(ids).not.toContain('019f6bb9-65fd-7ef3-8053-8e3333a9f111')
 
     // E1's backfill entry must carry ITS OWN plays/date from the allLeaves
-    // stub (viewCount 1, lastViewedAt 1788000000), not the scrobble's
+    // stub (viewCount 3, lastViewedAt 1788000000), not the scrobble's
     // (viewCount 1, lastViewedAt 1789553428). Pins iso()'s unix-seconds unit:
     // if iso() were changed to treat the value as milliseconds, this exact
     // string would no longer match.
     const e1Op = ops.find((o: any) => o.table === 'entries' && o.pk.entityId === '019f6bb9-65fd-7ef3-8053-8e3333a9f110')
-    expect(e1Op.fields.plays).toBe(1)
+    expect(e1Op.fields.plays).toBe(3)
 
     const e1Patch = calls.find(c =>
       /me\/watches\//.test(c.url) && c.init?.method === 'PATCH' &&

@@ -183,7 +183,15 @@ export async function handlePlex(d: AppDeps, s: PlexScrobble): Promise<HandlerRe
           backfill.push({ episodeId: epId, plays: Math.max(1, Math.trunc(l.viewCount)), watchedAt: iso(l.lastViewedAt) })
         }
         d.store.setAllLeavesReconciled(s.showRatingKey!, reconciled)
-      } catch { /* backfill is best-effort; the scrobble itself still lands */ }
+      } catch (e) {
+        // Wider than just the fetchAllLeaves call: this also catches sqlite
+        // errors thrown mid-loop by getEpisodeId/getSyncRow (via
+        // alreadyWatched), in which case `backfill` ships whatever was built
+        // before the throw, not a full reconciliation. Best-effort by design
+        // -- the scrobble itself still lands -- but logged so a partial
+        // backfill is diagnosable instead of silently swallowed.
+        console.warn('[handlePlex] backfill scan failed, proceeding with partial/no backfill:', (e as Error).message)
+      }
     }
   }
 
