@@ -1,102 +1,47 @@
-# Every variable the service reads is listed below, so this file is the one
-# place to look for what is configurable. Values come from a sibling .env via
-# compose interpolation (that is variable substitution, not env_file -- the
-# container only ever receives what is listed here).
-#
-#   ${VAR:?...}  required, compose refuses to start without it
-#   ${VAR:-x}    optional, defaults to x
-
 services:
-  bingers-sync:
-    # Published by CI on every push to main (linux/amd64).
-    # Pin a :<sha> tag instead of :latest for reproducible deploys.
-    image: ghcr.io/vicegold/bingers-sync:latest
-    pull_policy: always
-    restart: unless-stopped
+    bingers-sync:
+        image: ghcr.io/vicegold/bingers-sync:latest
+        restart: unless-stopped
+        environment:
+            # secrets come from .env, everything else is set here
+            - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE}
+            - PLEX_URL=${PLEX_URL}
+            - PLEX_TOKEN=${PLEX_TOKEN}
+            - DRY_RUN=true
+            - ALLOWED_USER=plexuser
+            - PORT=8787
+            - DB_PATH=/data/bingers-sync.db
+            - NOTIFY_URL=
+            - CATALOG_TTL_HOURS=24
+            - PLEX_ALLLEAVES_TTL_MIN=60
+            - SYNC_PULL_INTERVAL_MIN=30
+            - WATCH_DATE_TOLERANCE_SEC=120
+            - SEARCH_MAX_PAGES=3
+        volumes:
+            - ./data:/data
+        ports:
+            - 8787:8787
 
-    ports:
-      - target: ${PORT:-8787}
-        published: ${PORT:-8787}
-        protocol: tcp
-        mode: host
-
-    volumes:
-      - type: bind
-        source: ./data
-        target: /data
-
-    environment:
-      # --- required: no sensible default, the service cannot run without them
-      # Captured from the Bingers app's traffic (__Secure-better-auth.session_token).
-      BINGERS_SESSION_COOKIE: ${BINGERS_SESSION_COOKIE:?set BINGERS_SESSION_COOKIE in .env}
-      # Use the LAN IP, not a hostname -- container DNS will not resolve .local names.
-      PLEX_URL: ${PLEX_URL:?set PLEX_URL in .env, e.g. http://192.168.1.10:32400}
-      PLEX_TOKEN: ${PLEX_TOKEN:?set PLEX_TOKEN in .env}
-
-      # --- safety
-      # Disabled ONLY by the exact string "false"; any typo keeps writes off.
-      DRY_RUN: ${DRY_RUN:-true}
-      # Plex Account.title / Pulsarr data.addedBy.username. Anything else is ignored.
-      ALLOWED_USER: ${ALLOWED_USER:-plexuser}
-
-      # --- storage and network
-      PORT: ${PORT:-8787}
-      # Must sit under the bind mount above, or the outbox dies with the container.
-      DB_PATH: ${DB_PATH:-/data/bingers-sync.db}
-      # Webhook for failures and write-halts. Unset means log-only.
-      NOTIFY_URL: ${NOTIFY_URL:-}
-
-      # --- tuning (defaults match the spec; change only with a reason)
-      # Proactive versions.json re-check. A cache MISS re-checks regardless.
-      CATALOG_TTL_HOURS: ${CATALOG_TTL_HOURS:-24}
-      # Minimum gap between /allLeaves backfill scans for the same Plex show.
-      PLEX_ALLLEAVES_TTL_MIN: ${PLEX_ALLLEAVES_TTL_MIN:-60}
-      # How often the local follows/entries mirror refreshes.
-      SYNC_PULL_INTERVAL_MIN: ${SYNC_PULL_INTERVAL_MIN:-30}
-      # Skip the date-correction PATCH when the server stamp is already this close.
-      WATCH_DATE_TOLERANCE_SEC: ${WATCH_DATE_TOLERANCE_SEC:-120}
-      # Search pages scanned before declaring a title unresolvable.
-      SEARCH_MAX_PAGES: ${SEARCH_MAX_PAGES:-3}
-      # Sent to api.bingers.app; defaults to the real app's UA.
-      BINGERS_USER_AGENT: ${BINGERS_USER_AGENT:-}
-
-    healthcheck:
-      # Reports dryRun, session days remaining, writesHalted, outboxDepth and
-      # mirror freshness.
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:${PORT:-8787}/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-      interval: 60s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
-
-  # Local iteration against the working tree:
-  #   docker compose --profile dev up -d --build bingers-sync-dev
-  bingers-sync-dev:
-    profiles: ["dev"]
-    build:
-      context: .
-    restart: unless-stopped
-    ports:
-      - target: ${PORT:-8787}
-        published: ${PORT:-8787}
-        protocol: tcp
-        mode: host
-    volumes:
-      - type: bind
-        source: ./data
-        target: /data
-    environment:
-      BINGERS_SESSION_COOKIE: ${BINGERS_SESSION_COOKIE:?set BINGERS_SESSION_COOKIE in .env}
-      PLEX_URL: ${PLEX_URL:?set PLEX_URL in .env}
-      PLEX_TOKEN: ${PLEX_TOKEN:?set PLEX_TOKEN in .env}
-      DRY_RUN: ${DRY_RUN:-true}
-      ALLOWED_USER: ${ALLOWED_USER:-plexuser}
-      PORT: ${PORT:-8787}
-      DB_PATH: ${DB_PATH:-/data/bingers-sync.db}
-      NOTIFY_URL: ${NOTIFY_URL:-}
-      CATALOG_TTL_HOURS: ${CATALOG_TTL_HOURS:-24}
-      PLEX_ALLLEAVES_TTL_MIN: ${PLEX_ALLLEAVES_TTL_MIN:-60}
-      SYNC_PULL_INTERVAL_MIN: ${SYNC_PULL_INTERVAL_MIN:-30}
-      WATCH_DATE_TOLERANCE_SEC: ${WATCH_DATE_TOLERANCE_SEC:-120}
-      SEARCH_MAX_PAGES: ${SEARCH_MAX_PAGES:-3}
-      BINGERS_USER_AGENT: ${BINGERS_USER_AGENT:-}
+    bingers-sync-dev:
+        profiles:
+            - dev
+        build: .
+        restart: unless-stopped
+        environment:
+            - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE}
+            - PLEX_URL=${PLEX_URL}
+            - PLEX_TOKEN=${PLEX_TOKEN}
+            - DRY_RUN=true
+            - ALLOWED_USER=plexuser
+            - PORT=8787
+            - DB_PATH=/data/bingers-sync.db
+            - NOTIFY_URL=
+            - CATALOG_TTL_HOURS=24
+            - PLEX_ALLLEAVES_TTL_MIN=60
+            - SYNC_PULL_INTERVAL_MIN=30
+            - WATCH_DATE_TOLERANCE_SEC=120
+            - SEARCH_MAX_PAGES=3
+        volumes:
+            - ./data:/data
+        ports:
+            - 8787:8787
