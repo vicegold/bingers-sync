@@ -1,5 +1,5 @@
-import type { Store } from './store.js'
-import { searchTitles, fetchMetadata, externalIdMap, type TitleMetadata } from './bingers/catalog.js'
+import type { Store, EpisodeMapping } from './store.js'
+import { searchTitles, fetchMetadata, externalIdMap, fetchVersions, fetchSeason, type TitleMetadata } from './bingers/catalog.js'
 
 export type ExternalIds = { tmdb?: string; tvdb?: string; imdb?: string }
 export type ResolveDeps = { store: Store; fetchImpl?: typeof fetch; searchMaxPages: number }
@@ -57,4 +57,43 @@ export async function resolveTitle(
     }
   }
   return { failure: `no external id match for ${args.kind} ${JSON.stringify(args.ids)}` }
+}
+
+export type EpisodeDeps = ResolveDeps & { catalogTtlHours: number }
+
+export async function hydrateEpisodes(deps: EpisodeDeps, titleId: string): Promise<void> {
+  const fetchImpl = deps.fetchImpl ?? fetch
+  const files = await fetchVersions(titleId, fetchImpl)
+  deps.store.putCatalogVersion(titleId, files)
+  const seasons = files.seasons ?? {}
+  for (const [seasonStr, hash] of Object.entries(seasons)) {
+    const season = Number(seasonStr)
+    let eps
+    try {
+      eps = await fetchSeason(titleId, season, hash, fetchImpl)
+    } catch { continue }
+    const rows: EpisodeMapping[] = eps.map(e => ({
+      titleId, season, number: e.n, episodeId: e.id,
+      abs: e.abs ?? null, title: e.title ?? null, aired: e.aired ?? null, seasonHash: hash,
+    }))
+    if (rows.length) deps.store.putEpisodes(rows)
+  }
+}
+
+export async function resolveEpisode(
+  deps: EpisodeDeps,
+  args: { titleId: string; season: number; number: number },
+): Promise<{ episodeId: string } | { failure: string }> {
+  const hit = deps.store.getEpisodeId(args.titleId, args.season, args.number)
+  if (hit) return { episodeId: hit }
+
+  try {
+    await hydrateEpisodes(deps, args.titleId)
+  } catch (e) {
+    return { failure: `catalog hydrate failed: ${(e as Error).message}` }
+  }
+
+  const after = deps.store.getEpisodeId(args.titleId, args.season, args.number)
+  if (after) return { episodeId: after }
+  return { failure: `no episode S${args.season}E${args.number} for title ${args.titleId}` }
 }
