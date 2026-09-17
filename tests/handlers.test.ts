@@ -56,9 +56,9 @@ const ROUTES: [RegExp, Body][] = [
     // viewCount deliberately differs from SCROBBLE's (1): if the backfill op
     // ever carried the scrobble's plays instead of this leaf's own, a test
     // asserting plays===1 here would pass by coincidence and miss the bug.
-    { parentIndex: 1, index: 1, viewCount: 3, lastViewedAt: 1788000000 },
-    { parentIndex: 1, index: 2 },
-    { parentIndex: 1, index: 3, viewCount: 1, lastViewedAt: 1789553428 },
+    { ratingKey: '90364', parentIndex: 1, index: 1, viewCount: 3, lastViewedAt: 1788000000 },
+    { ratingKey: '90365', parentIndex: 1, index: 2 },
+    { ratingKey: '90366', parentIndex: 1, index: 3, viewCount: 1, lastViewedAt: 1789553428 },
   ] } }],
   [/search\/titles/, fx('search-tires')],
   [/metadata@543408442fd2/, fx('metadata-tires')],
@@ -150,6 +150,25 @@ describe('handlePlex', () => {
   })
 })
 
+describe('handlePlex show ratingKey capture', () => {
+  // The ratingKey cache is an identity mapping, not a consumable outbound
+  // write -- it must still be recorded under DRY_RUN, or the reverse
+  // direction (src/ratings/toPlex.ts) would find every episode unmapped for
+  // as long as it takes fresh scrobbles to arrive after DRY_RUN is flipped
+  // to 'false', even though DRY_RUN defaults to 'true'.
+  it('records the show ratingKey from a scrobble even under DRY_RUN', async () => {
+    const dryCfg = loadConfig({
+      BINGERS_SESSION_COOKIE: 'TOK', PLEX_URL: 'http://plex', PLEX_TOKEN: 'pt',
+      ALLOWED_USER: 'testuser', DRY_RUN: 'true',
+    } as NodeJS.ProcessEnv)
+    const { f } = router(ROUTES)
+    const r = await handlePlex({ config: dryCfg, store, auth: createAuth(store, 'TOK', 'UA'), gate: createGate(), fetchImpl: f as typeof fetch, newId }, SCROBBLE)
+    expect(r.status).toBe('ok')
+    // 'Tires' show's titleId, per tests/fixtures/metadata-tires.json
+    expect(store.showRatingKeyFor('019f6bb9-65cf-78d1-b123-f9ed891fe9d7')).toBe('90363')
+  })
+})
+
 const entryIds = (calls: { url: string; init?: any }[]) =>
   JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
     .filter((o: any) => o.table === 'entries').map((o: any) => o.pk.entityId)
@@ -211,8 +230,8 @@ describe('handlePlex leaf hygiene', () => {
     store.markMirrorSynced()
     const { f, calls } = router([
       [/allLeaves/, { MediaContainer: { Metadata: [
-        { parentIndex: 1, index: 1, viewCount: 'lots', lastViewedAt: 1788000000 },
-        { parentIndex: 1, index: 3, viewCount: 1, lastViewedAt: 1789553428 },
+        { ratingKey: '90364', parentIndex: 1, index: 1, viewCount: 'lots', lastViewedAt: 1788000000 },
+        { ratingKey: '90366', parentIndex: 1, index: 3, viewCount: 1, lastViewedAt: 1789553428 },
       ] } }],
       ...ROUTES,
     ])
@@ -224,8 +243,8 @@ describe('handlePlex leaf hygiene', () => {
     store.markMirrorSynced()
     const { f, calls } = router([
       [/allLeaves/, { MediaContainer: { Metadata: [
-        { parentIndex: 1, index: 1, viewCount: 2 }, // watched, but plex has no timestamp
-        { parentIndex: 1, index: 3, viewCount: 1, lastViewedAt: 1789553428 },
+        { ratingKey: '90364', parentIndex: 1, index: 1, viewCount: 2 }, // watched, but plex has no timestamp
+        { ratingKey: '90366', parentIndex: 1, index: 3, viewCount: 1, lastViewedAt: 1789553428 },
       ] } }],
       ...ROUTES,
     ])
@@ -404,5 +423,25 @@ describe('handlePulsarr', () => {
     const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
     expect(ops[0].deleted).toBe(true)
     expect(ops[0].fields).toBeUndefined()
+  })
+
+  it('does not re-follow a title bingers already has followed', async () => {
+    store.putSyncRows('follows', [{ pk: 'M1', row: { titleId: 'M1', kind: 'show', deletedAt: null } }])
+    store.putTitleMapping([{ source: 'tmdb', extId: '5920', kind: 'show', titleId: 'M1', title: 'The Mentalist', year: 2008 }])
+    const { f, calls } = router([[/sync\/push/, { results: [], rows: {} }]])
+    const r = await handlePulsarr(deps(f), {
+      user: 'testuser', action: 'added', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
+    })
+    expect(r.status).toBe('ok')
+    expect(calls.some(c => /sync\/push/.test(c.url))).toBe(false)
+  })
+
+  it('still follows a title bingers does not have', async () => {
+    store.putTitleMapping([{ source: 'tmdb', extId: '5920', kind: 'show', titleId: 'M1', title: 'The Mentalist', year: 2008 }])
+    const { f, calls } = router([[/sync\/push/, { results: [{ opId: 'x', status: 'applied' }], rows: {} }]])
+    await handlePulsarr(deps(f), {
+      user: 'testuser', action: 'added', title: 'The Mentalist', kind: 'show', guids: [{ id: 'tmdb://5920' }],
+    })
+    expect(calls.some(c => /sync\/push/.test(c.url))).toBe(true)
   })
 })

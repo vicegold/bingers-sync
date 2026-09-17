@@ -2,8 +2,11 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { openStore, type Store } from '../src/store.js'
 import { createAuth } from '../src/bingers/auth.js'
 import { loadConfig } from '../src/config.js'
-import { createApp } from '../src/server.js'
-import { createGate } from '../src/outbox.js'
+import { createApp, boot } from '../src/server.js'
+import { serve } from '@hono/node-server'
+import type { AddressInfo } from 'node:net'
+import { createGate, flushOutbox, MAX_OP_REJECTIONS } from '../src/outbox.js'
+import { syncRatingsToPlex } from '../src/ratings/toPlex.js'
 
 let store: Store
 beforeEach(() => { store = openStore(':memory:') })
@@ -176,7 +179,7 @@ describe('/setup', () => {
 
   // The other way in: the session was fine and went dead. A 401 anywhere on the
   // write path halts the gate, and that is exactly when setup has to reopen --
-  // otherwise re-authenticating means editing .env and restarting again.
+  // otherwise re-authenticating means editing compose and restarting again.
   it('reopens when the write gate has halted on a dead session', async () => {
     const gate = createGate()
     gate.halt('bingers 401')
@@ -347,5 +350,184 @@ describe('/setup', () => {
     const { app, auth } = setupApp({ fetchImpl })
     expect((await app.request('/setup', paste(LINK))).status).toBe(200)
     expect(auth.cookieHeader()).toBe('__Secure-better-auth.session_token=FRESH')
+  })
+})
+
+// RRR2. An abandoned op is a user write this service has decided to stop
+// trying to deliver -- the single most important thing here not to lose
+// silently. The cap is global: this is a plain watched op, not a rating.
+describe('abandoned ops are visible on /health', () => {
+  it('reports zero while nothing has been abandoned', async () => {
+    const b = await (await app().request('/health')).json() as Record<string, unknown>
+    expect(b).toHaveProperty('abandonedOps', 0)
+  })
+
+  it('reports a non-zero count once an op has been abandoned', async () => {
+    const op = {
+      opId: 'w1', table: 'entries' as const,
+      pk: { entityKind: 'episode' as const, entityId: 'E1' },
+      fields: { watched: true as const, plays: 1, batchId: null },
+    }
+    store.enqueueOps([op])
+    // A 200 whose `results` confirm nothing: bingers answered and refused.
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({ results: [], rows: {} }), { status: 200 })) as any
+    const sd = {
+      auth: createAuth(store, 'TOK', 'UA'), store, userAgent: 'UA',
+      dryRun: false, watchDateToleranceSec: 120, fetchImpl,
+    }
+    const gate = createGate()
+    for (let i = 0; i < MAX_OP_REJECTIONS; i++) {
+      store.reschedule('w1', new Date(0).toISOString())
+      await flushOutbox(sd, gate)
+    }
+
+    const b = await (await app().request('/health')).json() as Record<string, unknown>
+    expect(b).toHaveProperty('abandonedOps', 1)
+    expect(b).toHaveProperty('outboxDepth', 0)
+  })
+})
+
+describe('reverse sync health', () => {
+  it('reports reverse sync state on /health', async () => {
+    const res = await app().request('/health')
+    const b = await res.json() as Record<string, unknown>
+    expect(b).toHaveProperty('reverseSync')
+    expect(b).toHaveProperty('watchlistLinked', 0)
+  })
+})
+
+describe('rating sync health', () => {
+  it('reports rating sync state on /health', async () => {
+    const res = await app().request('/health')
+    const b = await res.json() as Record<string, unknown>
+    expect(b).toHaveProperty('ratingSync')
+    expect(b).toHaveProperty('ratingsLinked', 0)
+    expect(b).toHaveProperty('lastRatingRun', null)
+  })
+
+  // Step 1 only checks the keys exist, which would pass against a /health that
+  // reports zeroes forever. `refusedHalfStar` is the half-star safety guard
+  // actively declining a write -- the EVENT, reported separately from layer
+  // 1's steady state, which is the whole point of splitting them -- so this drives
+  // a REAL syncRatingsToPlex run against a fixture that must be refused (plex's
+  // live value is 9, an odd/half-star rating; bingers holds the rounded 5;
+  // writing back bingersToPlex(5)=10 would destroy the half-star) and confirms
+  // /health surfaces that true count once lastRatingRun carries the result.
+  it('surfaces a real refused-write count from an actual rating run on /health', async () => {
+    store.putSyncRows('entries', [{ pk: 'movie:M1', row: { entityKind: 'movie', entityId: 'M1', rating: 5, watched: true, deletedAt: null } }])
+    store.putTitleMapping([{ source: 'tmdb', extId: '467244', kind: 'movie', titleId: 'M1', title: 'The Zone of Interest', year: 2023 }])
+    const routes: [RegExp, unknown][] = [
+      [/library\/sections$/, { MediaContainer: { Directory: [{ key: '2', type: 'movie', title: 'Filme' }] } }],
+      [/sections\/2\/all/, { MediaContainer: { Metadata: [
+        { ratingKey: '46807', type: 'movie', title: 'The Zone of Interest', userRating: 9, Guid: [{ id: 'tmdb://467244' }] },
+      ] } }],
+      [/:\/rate/, {}],
+    ]
+    const fetchImpl = vi.fn(async (url: string) => {
+      for (const [re, body] of routes) if (re.test(url)) return new Response(JSON.stringify(body), { status: 200 })
+      return new Response('{}', { status: 404 })
+    }) as any
+    const auth = createAuth(store, 'TOK', 'UA')
+    const gate = createGate()
+    const toPlex = await syncRatingsToPlex({ config: CONFIG, store, auth, gate, fetchImpl })
+    // Sanity check on the fixture itself, not the wiring under test.
+    expect(toPlex.refusedHalfStar).toBe(1)
+    expect(toPlex.refusedOrigin).toBe(0)
+    expect(toPlex.written).toBe(0)
+
+    const deps = {
+      config: CONFIG, store, auth, gate, fetchImpl,
+      lastRatingRun: () => ({
+        at: new Date().toISOString(),
+        fromPlex: { synced: 0, unsupported: 0, unresolved: 0, ignored: 0, failed: 0 },
+        toPlex,
+      }),
+    }
+    const res = await createApp(deps).request('/health')
+    const b = await res.json() as any
+    // Reported SEPARATELY on /health: a steady-state layer 1 refusal and a
+    // half-star save must not be one indistinguishable number there.
+    expect(b.lastRatingRun.toPlex.refusedHalfStar).toBe(1)
+    expect(b.lastRatingRun.toPlex.refusedOrigin).toBe(0)
+    expect(b.lastRatingRun.toPlex.written).toBe(0)
+  })
+})
+
+// I3: pull(), beat() and reverse() all await third-party hosts, and reverse()
+// is up to REVERSE_BATCH x 7 sequential plex discover requests. Awaiting any of
+// them before the listener opens means that while a third party is merely slow,
+// the port is CLOSED -- every Plex media.scrobble gets connection-refused
+// instead of the 200 the forward path depends on, and Plex never replays them.
+describe('boot order', () => {
+  it('serves /health within a second of start, with the boot reconcile still hung', async () => {
+    const never = () => new Promise<void>(() => { /* a discover host that never answers */ })
+    let server: ReturnType<typeof serve> | undefined
+    let port = 0
+    const listening = new Promise<void>(resolve => {
+      void boot({
+        listen: () => { server = serve({ fetch: app().fetch, port: 0 }, (info: AddressInfo) => { port = info.port; resolve() }) },
+        pull: never, beat: never, reverse: never, ratings: never, flush: never,
+        pullIntervalMin: 30,
+        schedule: () => { /* no real intervals in a test */ },
+      })
+    })
+
+    try {
+      await Promise.race([
+        listening,
+        new Promise((_r, rej) => setTimeout(() => rej(new Error('listener did not open within 1s')), 1000)),
+      ])
+      const res = await fetch(`http://127.0.0.1:${port}/health`)
+      expect(res.status).toBe(200)
+      expect(await res.json()).toMatchObject({ ok: true })
+    } finally {
+      server?.close()
+    }
+  })
+
+  it('registers the recurring timers before awaiting the boot reconcile', async () => {
+    const never = () => new Promise<void>(() => {})
+    const scheduled: number[] = []
+    void boot({
+      listen: () => {}, pull: never, beat: never, reverse: never, ratings: never, flush: never,
+      pullIntervalMin: 30, schedule: (_fn, ms) => { scheduled.push(ms) },
+    })
+    await Promise.resolve()
+    expect(scheduled).toEqual([30 * 60_000, 24 * 60 * 60_000, 60_000])
+  })
+
+  // Finding 13, re-flagged: the pull -> reverse -> ratings chain is sequential
+  // and unbounded, and ratings alone can outlast a 30-minute interval on a
+  // large library. Two overlapping chains interleave outbox writes and
+  // sync_state mirrors for the same entities -- the half-updated local state
+  // RR1's transaction exists to prevent, arriving through a second door.
+  it('skips a scheduled cycle while the previous one is still running', async () => {
+    const settled = () => new Promise(r => setImmediate(r))
+    let release!: () => void
+    const held = new Promise<void>(r => { release = r })
+    let blocking = false
+    const pulls: number[] = []
+    const pull = async () => { pulls.push(pulls.length); if (blocking) await held }
+    const noop = async () => {}
+    let tick!: () => void
+    void boot({
+      listen: () => {}, pull, beat: noop, reverse: noop, ratings: noop, flush: noop,
+      pullIntervalMin: 30,
+      schedule: (fn, ms) => { if (ms === 30 * 60_000) tick = fn },
+    })
+    await settled()
+    // boot's own reconcile pull already ran and completed (blocking was false).
+    expect(pulls).toHaveLength(1)
+
+    blocking = true
+    tick(); await settled()
+    expect(pulls).toHaveLength(2) // cycle 1 started, now parked on `held`
+    tick(); await settled()
+    expect(pulls).toHaveLength(2) // cycle 2 SKIPPED, not queued
+
+    release(); await settled()
+    tick(); await settled()
+    expect(pulls).toHaveLength(3) // the flag cleared, so ticks work again
   })
 })

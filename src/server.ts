@@ -10,6 +10,9 @@ import { createGate, flushOutbox } from './outbox.js'
 import { notify } from './notify.js'
 import { parseMagicLinkToken, redeemMagicLink } from './bingers/magic-link.js'
 import { setupPage } from './routes/setup-page.js'
+import { reconcileWatchlist } from './reverse.js'
+import { syncRatingsFromPlex, type RatingSyncResult } from './ratings/fromPlex.js'
+import { syncRatingsToPlex, type RatingToPlexResult } from './ratings/toPlex.js'
 
 /**
  * /setup is self-closing: it exists only to acquire a session cookie, so it
@@ -52,12 +55,21 @@ export function createApp(deps: AppDeps) {
       writesHalted: deps.gate.halted,
       haltReason: deps.gate.reason,
       outboxDepth: deps.store.outboxDepth(),
+      // Ops this service has GIVEN UP delivering (MAX_OP_REJECTIONS explicit
+      // bingers refusals). A dropped user write must never be silent; the
+      // matching `failures` row carries the payload to replay by hand.
+      abandonedOps: deps.store.abandonedDepth(),
       failures: deps.store.listFailures(1).length,
       mirrorSyncedAt: mirror.syncedAt,
       mirrorFresh: mirror.fresh,
       mirrorMaxAgeMin: mirror.maxAgeMin,
       backfillEnabled: mirror.fresh,
       setupRequired: setupOpen(deps),
+      reverseSync: deps.config.reverseSync,
+      watchlistLinked: deps.store.countPlexLinks('added'),
+      ratingSync: deps.config.ratingSync,
+      ratingsLinked: deps.store.countRatingLinks(),
+      lastRatingRun: deps.lastRatingRun ? deps.lastRatingRun() : null,
     })
   })
 
@@ -204,12 +216,65 @@ export function createApp(deps: AppDeps) {
   return app
 }
 
+export type BootSteps = {
+  listen: () => void
+  pull: () => Promise<void>
+  beat: () => Promise<void>
+  reverse: () => Promise<void>
+  ratings: () => Promise<void>
+  flush: () => Promise<void>
+  pullIntervalMin: number
+  schedule?: (fn: () => void, ms: number) => void
+}
+
+/**
+ * Start listening FIRST, then do the boot-time reconcile.
+ *
+ * pull(), beat() and reverse() all talk to third parties, and reverse() is up
+ * to REVERSE_BATCH x 7 sequential requests to plex discover. Awaiting any of
+ * them before serve() means that while a third party is merely slow, the port
+ * is closed: every Plex `media.scrobble` gets connection-refused instead of the
+ * 200 the forward path depends on, and Plex does not replay them. The listener
+ * has to be up within a second of start no matter what any remote host is
+ * doing, so the boot reconcile runs behind an already-open socket.
+ */
+export async function boot(s: BootSteps): Promise<void> {
+  s.listen()
+  const schedule = s.schedule ?? ((fn, ms) => { setInterval(fn, ms) })
+  // Registered before the first reconcile is awaited too, for the same reason:
+  // a hung boot pull must not also mean nothing is ever scheduled.
+  // The pull -> reverse -> ratings chain is sequential and unbounded: ratings
+  // alone walks every library section and every rated bingers entry, which can
+  // outlast a 30-minute interval on a large library. Two overlapping chains
+  // would not merely duplicate work -- they interleave outbox writes and
+  // sync_state mirrors for the same entities, which is precisely the
+  // half-updated local state RR1's transaction exists to prevent. A tick that
+  // arrives while the previous one is still running is SKIPPED, not queued:
+  // the next tick does the same work anyway.
+  let chainInFlight = false
+  schedule(() => {
+    if (chainInFlight) { console.log('[sync] previous cycle still running, skipping this tick'); return }
+    chainInFlight = true
+    void (async () => {
+      try { await s.pull(); await s.reverse(); await s.ratings() } finally { chainInFlight = false }
+    })()
+  }, s.pullIntervalMin * 60_000)
+  schedule(() => { void s.beat() }, 24 * 60 * 60_000)
+  schedule(() => { void s.flush() }, 60_000)
+
+  await s.pull(); await s.beat(); await s.reverse(); await s.ratings()
+}
+
 async function main() {
   const config = loadConfig(process.env)
   const store = openStore(config.dbPath)
   const auth = createAuth(store, config.bingersCookie, config.bingersUserAgent)
   const gate = createGate()
-  const deps: AppDeps = { config, store, auth, gate }
+  // Declared before `deps` so the /health getter below closes over the same
+  // binding that `ratings()` reassigns after each run -- a snapshot taken at
+  // wiring time would freeze at null forever.
+  let lastRatingRun: { at: string; fromPlex: RatingSyncResult; toPlex: RatingToPlexResult } | null = null
+  const deps: AppDeps = { config, store, auth, gate, lastRatingRun: () => lastRatingRun }
   const sd = {
     auth, store, userAgent: config.bingersUserAgent, dryRun: config.dryRun,
     watchDateToleranceSec: config.watchDateToleranceSec, notifyUrl: config.notifyUrl,
@@ -253,14 +318,44 @@ async function main() {
       if (n) console.log(`[outbox] flushed ${n} op(s)`)
     } catch (e) { console.error('[outbox]', (e as Error).message) }
   }
+  const reverse = async () => {
+    try {
+      const r = await reconcileWatchlist({ config, store })
+      if (r.added || r.unresolved || r.deferred) {
+        console.log(`[reverse] added ${r.added}, unresolved ${r.unresolved}, deferred ${r.deferred}`)
+      }
+    } catch (e) { console.error('[reverse]', (e as Error).message) }
+  }
+  // fromPlex runs BEFORE toPlex and the order is load-bearing: fromPlex writes
+  // the rating_link rows carrying origin 'plex', and toPlex reads exactly those
+  // to decide what it must refuse to write back. Reversed, the first run of a
+  // newly-rated item would write back before the link exists.
+  const ratings = async () => {
+    if (!config.ratingSync) return
+    try {
+      const rd = { config, store, auth, gate }
+      const fromPlex = await syncRatingsFromPlex(rd)
+      const toPlex = await syncRatingsToPlex(rd)
+      lastRatingRun = { at: new Date().toISOString(), fromPlex, toPlex }
+      const busy = Object.values(fromPlex).some(n => n > 0) || Object.values(toPlex).some(n => n > 0)
+      if (busy) {
+        console.log(
+          `[ratings] plex->bingers synced ${fromPlex.synced} unsupported ${fromPlex.unsupported}`
+          + ` unresolved ${fromPlex.unresolved} ignored ${fromPlex.ignored} failed ${fromPlex.failed}`
+          + ` | bingers->plex written ${toPlex.written}`
+          + ` refused-origin ${toPlex.refusedOrigin} refused-halfstar ${toPlex.refusedHalfStar}`
+          + ` skipped ${toPlex.skipped} unmapped ${toPlex.unmapped} failed ${toPlex.failed}`)
+      }
+    } catch (e) { console.error('[ratings]', (e as Error).message) }
+  }
 
-  await pull(); await beat()
-  setInterval(pull, config.syncPullIntervalMin * 60_000)
-  setInterval(beat, 24 * 60 * 60_000)
-  setInterval(flush, 60_000)
-
-  console.log(`bingers-sync on :${config.port} (DRY_RUN=${config.dryRun})`)
-  serve({ fetch: createApp(deps).fetch, port: config.port })
+  await boot({
+    listen: () => {
+      serve({ fetch: createApp(deps).fetch, port: config.port })
+      console.log(`bingers-sync on :${config.port} (DRY_RUN=${config.dryRun}, REVERSE_SYNC=${config.reverseSync}, RATING_SYNC=${config.ratingSync})`)
+    },
+    pull, beat, reverse, ratings, flush, pullIntervalMin: config.syncPullIntervalMin,
+  })
 }
 
 if (process.argv[1]?.endsWith('server.js') || process.argv[1]?.endsWith('server.ts')) void main()

@@ -39,27 +39,37 @@ describe('fetchShowIds', () => {
 })
 
 describe('fetchAllLeaves', () => {
-  it('maps episodes to season/number/viewCount/lastViewedAt', async () => {
+  it('maps episodes to season/number/viewCount/lastViewedAt/ratingKey/userRating', async () => {
     const f = stub({ MediaContainer: { Metadata: [
-      { parentIndex: 1, index: 1, viewCount: 1, lastViewedAt: 1789000000, title: 'Pilot' },
-      { parentIndex: 1, index: 2, title: 'Unwatched' },
-      { parentIndex: 1, index: 3, viewCount: 2, lastViewedAt: 1789553428, title: 'Sales Contest' },
+      { ratingKey: '90364', parentIndex: 1, index: 1, viewCount: 1, lastViewedAt: 1789000000, title: 'Pilot' },
+      { ratingKey: '90365', parentIndex: 1, index: 2, title: 'Unwatched' },
+      { ratingKey: '90366', parentIndex: 1, index: 3, viewCount: 2, lastViewedAt: 1789553428, title: 'Sales Contest', userRating: 9 },
     ] } })
     const eps = await fetchAllLeaves(deps(f), '90363')
     expect((f as any).mock.calls[0][0]).toBe('http://plex.local:32400/library/metadata/90363/allLeaves')
     expect(eps).toHaveLength(3)
-    expect(eps[1]).toEqual({ season: 1, number: 2, viewCount: 0, lastViewedAt: null, title: 'Unwatched' })
-    expect(eps[2]).toEqual({ season: 1, number: 3, viewCount: 2, lastViewedAt: 1789553428, title: 'Sales Contest' })
+    expect(eps[1]).toEqual({ season: 1, number: 2, viewCount: 0, lastViewedAt: null, title: 'Unwatched', ratingKey: '90365', userRating: null })
+    expect(eps[2]).toEqual({ season: 1, number: 3, viewCount: 2, lastViewedAt: 1789553428, title: 'Sales Contest', ratingKey: '90366', userRating: 9 })
   })
 
   it('excludes leaves with no usable season/episode number instead of carrying NaN', async () => {
     const f = stub({ MediaContainer: { Metadata: [
-      { parentIndex: 1, index: 1, viewCount: 1, lastViewedAt: 1789000000, title: 'Pilot' },
-      { index: 2, title: 'No season' },
-      { parentIndex: 1, title: 'No episode number' },
+      { ratingKey: '90364', parentIndex: 1, index: 1, viewCount: 1, lastViewedAt: 1789000000, title: 'Pilot' },
+      { ratingKey: '90365', index: 2, title: 'No season' },
+      { ratingKey: '90366', parentIndex: 1, title: 'No episode number' },
     ] } })
     const eps = await fetchAllLeaves(deps(f), '90363')
     expect(eps).toHaveLength(1)
     expect(eps[0]!.title).toBe('Pilot')
+  })
+
+  it('excludes a leaf with no usable ratingKey instead of carrying the literal "undefined" into a rate URL', async () => {
+    const f = stub({ MediaContainer: { Metadata: [
+      { parentIndex: 1, index: 1, viewCount: 1, lastViewedAt: 1789000000, title: 'No ratingKey' },
+      { ratingKey: '90366', parentIndex: 1, index: 2, viewCount: 1, lastViewedAt: 1789000000, title: 'Has ratingKey' },
+    ] } })
+    const eps = await fetchAllLeaves(deps(f), '90363')
+    expect(eps).toHaveLength(1)
+    expect(eps[0]!.title).toBe('Has ratingKey')
   })
 })

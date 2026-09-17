@@ -3,10 +3,13 @@ services:
         image: ghcr.io/vicegold/bingers-sync:latest
         restart: unless-stopped
         environment:
-            - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE:-} # optional seed, normally empty; the session comes from /setup and lives in the db
-            - PLEX_URL=${PLEX_URL} # plex base url, use the LAN ip not a hostname
-            - PLEX_TOKEN=${PLEX_TOKEN} # plex api token
-            - ALLOWED_USER=${ALLOWED_USER} # whose activity to sync, everyone else is ignored
+            # Fill in the three below. This file is tracked in git, so if you push
+            # this repo anywhere, keep your real token out of the commit --
+            # `git update-index --skip-worktree docker-compose.yml` is the usual trick.
+            - PLEX_URL=http://192.168.x.x:32400 # plex base url, use the LAN ip not a hostname
+            - PLEX_TOKEN= # plex api token
+            - ALLOWED_USER= # whose activity to sync, everyone else is ignored
+            # - BINGERS_SESSION_COOKIE= # leave unset; the session comes from /setup and lives in the db
             # - DRY_RUN=true # log writes instead of sending them, only "false" disables it
             # - PORT=8787 # port the service listens on
             # - DB_PATH=/data/bingers-sync.db # sqlite file, keep it under the bind mount
@@ -17,6 +20,9 @@ services:
             # - WATCH_DATE_TOLERANCE_SEC=120 # skip the date fix if the server stamp is this close
             # - SEARCH_MAX_PAGES=3 # search pages checked before giving up on a title
             # - BINGERS_USER_AGENT= # ua sent to bingers, defaults to the real app's
+            # - REVERSE_SYNC=false # opt-in: add bingers follows to the plex watchlist, only "true" enables it
+            # - REVERSE_BATCH=10 # titles reconciled per pull, keeps the first run calm
+            # - RATING_SYNC=false # sync ratings both ways, off by default
         volumes:
             - ./data:/data
         ports:
@@ -28,10 +34,10 @@ services:
         build: .
         restart: unless-stopped
         environment:
-            - BINGERS_SESSION_COOKIE=${BINGERS_SESSION_COOKIE:-}
-            - PLEX_URL=${PLEX_URL}
-            - PLEX_TOKEN=${PLEX_TOKEN}
-            - ALLOWED_USER=${ALLOWED_USER}
+            # Same three values as above.
+            - PLEX_URL=http://192.168.x.x:32400
+            - PLEX_TOKEN=
+            - ALLOWED_USER=
         volumes:
             - ./data:/data
         ports:

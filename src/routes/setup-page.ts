@@ -47,7 +47,7 @@ export function setupPage(opts: { error?: string; done?: boolean }): string {
       <div class="card">
         <p class="ok">✓ Session stored</p>
         <p style="margin:0;color:var(--dim)">It survives restarts — it lives in the database under
-        <code>/data</code>, not in <code>.env</code>. Check <a href="/health">/health</a> for how long it lasts.
+        <code>/data</code>, not in <code>docker-compose.yml</code>. Check <a href="/health">/health</a> for how long it lasts.
         This page reopens on its own when the session expires or stops being accepted, and from then on
         it only accepts links for this same Bingers account.</p>
       </div>`)

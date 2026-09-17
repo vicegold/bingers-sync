@@ -9,10 +9,19 @@ import { planScrobble, planWatchlist } from './plan.js'
 import { type SyncDeps } from './bingers/sync.js'
 import { submit, type Gate } from './outbox.js'
 import { notify } from './notify.js'
+import type { RatingSyncResult } from './ratings/fromPlex.js'
+import type { RatingToPlexResult } from './ratings/toPlex.js'
+
+export type LastRatingRun = { at: string; fromPlex: RatingSyncResult; toPlex: RatingToPlexResult } | null
 
 export type AppDeps = {
   config: Config; store: Store; auth: Auth; gate: Gate
   fetchImpl?: typeof fetch; newId?: () => string
+  // A getter, not a snapshot, so /health reflects the latest ratings run
+  // rather than whatever lastRatingRun held at wiring time. Optional so
+  // existing callers that never touch ratings (handlers tests, etc.) don't
+  // have to thread it through.
+  lastRatingRun?: () => LastRatingRun
 }
 export type HandlerResult = { status: 'ok' | 'ignored' | 'failed'; reason?: string }
 
@@ -134,6 +143,22 @@ export async function handlePlex(d: AppDeps, s: PlexScrobble): Promise<HandlerRe
   const t = await resolveTitle(rd, { title: searchTitle, kind, ids })
   if ('failure' in t) return failResolve(d, 'plex', t, s)
 
+  // Captures the show's local ratingKey from the scrobble itself -- this is
+  // what lets the bingers->plex direction (src/ratings/toPlex.ts) walk
+  // show->allLeaves for an episode without ever searching plex by external
+  // id. Populating the cache is safe to leave unsuppressed under DRY_RUN --
+  // it is idempotent and cheap to overwrite, and DRY_RUN defaults to true,
+  // so gating it would mean a dry run captures zero show ratingKeys and
+  // every episode would report `unmapped` for a while after DRY_RUN is set
+  // to false. That does NOT make the cached value safe to trust blind on
+  // read, though: /plex has no shared secret and this ratingKey is
+  // server-local and reassignable (a library rebuild, a repointed
+  // PLEX_URL, a second server), so toPlex.ts re-verifies it against a
+  // shared external id before ever using it -- see leavesFor() there.
+  // Only for episodes: s.showRatingKey is guaranteed set by the check at
+  // the top of the episode branch above, and is always null for movies.
+  if (s.type === 'episode' && s.showRatingKey) d.store.putShowRatingKey(t.titleId, s.showRatingKey)
+
   let entityId = t.titleId
   if (s.type === 'episode') {
     if (s.season == null || s.number == null) return fail(d, 'plex', 'episode scrobble without season/number', s)
@@ -215,6 +240,12 @@ export async function handlePulsarr(d: AppDeps, e: PulsarrEvent): Promise<Handle
 
   const t = await resolveTitle(rd, { title: e.title, kind: e.kind, ids: parseGuids(e.guids) })
   if ('failure' in t) return failResolve(d, 'pulsarr', t, e)
+
+  // A title we pushed to the Plex watchlist comes back as a pulsarr
+  // watchlist.added. It is already followed on bingers, so re-emitting the op
+  // every cycle is a redundant write. Removal is NOT short-circuited -- an
+  // unfollow must always be sent.
+  if (e.action === 'added' && isFollowed(d.store, t.titleId)) return { status: 'ok' }
 
   const plan = planWatchlist({ titleId: t.titleId, kind: e.kind, action: e.action, newId })
   await submit(syncDeps(d), d.gate, plan.ops, plan.dated)

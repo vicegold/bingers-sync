@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { openStore, type Store } from '../src/store.js'
 import { createAuth } from '../src/bingers/auth.js'
-import { createGate, submit, flushOutbox, backoffMs } from '../src/outbox.js'
+import { createGate, submit, flushOutbox, backoffMs, MAX_OP_REJECTIONS } from '../src/outbox.js'
 
 let store: Store
 beforeEach(() => { store = openStore(':memory:') })
@@ -11,6 +11,16 @@ const OP = (id: string) => ({
   opId: id, table: 'entries' as const,
   pk: { entityKind: 'episode' as const, entityId: 'E' + id },
   fields: { watched: true as const, plays: 1, batchId: null },
+})
+const RATING_OP = (id: string, entityId: string, rating: number) => ({
+  opId: id, table: 'entries' as const,
+  pk: { entityKind: 'episode' as const, entityId },
+  fields: { rating },
+})
+const WATCHED_OP = (id: string, entityId: string, plays: number) => ({
+  opId: id, table: 'entries' as const,
+  pk: { entityKind: 'episode' as const, entityId },
+  fields: { watched: true as const, plays, batchId: null },
 })
 const mk = (f: any) => ({
   auth: createAuth(store, 'TOK', 'UA'), store, userAgent: 'UA',
@@ -160,6 +170,37 @@ describe('submit honours the per-op results of a 200', () => {
     expect(store.listFailures().some(x => /confirmed 1\/2/.test(x.reason))).toBe(true)
   })
 
+  // RRR1. submit()'s transaction was entirely untested -- removing it left
+  // every other test green -- on shared forward-path code. The property it
+  // actually provides is NOT "the rejected ops are safe" (they are gone either
+  // way; the throw happened while queueing them). It is that the APPLIED half
+  // is discarded too, so local state records none of the response rather than
+  // half of it -- and "none" is re-derivable from the next pull, while "half"
+  // is a mirror asserting a write landed, which is exactly what stops the
+  // forward path ever revisiting it.
+  it('discards the mirror too when queueing the rejected half throws, recording none of the response', async () => {
+    const partial = vi.fn(async (_url: string, init?: any) => {
+      const ops = JSON.parse(init.body).ops
+      return new Response(JSON.stringify({
+        results: [{ opId: ops[0].opId, status: 'applied' }, { opId: ops[1].opId, status: 'rejected' }], rows: {},
+      }), { status: 200 })
+    })
+    const deps = { ...mk(partial), store: { ...store, enqueueOps: () => { throw new Error('disk full') } } }
+    await expect(submit(deps as any, createGate(), [OP('1'), OP('2')])).rejects.toThrow('disk full')
+
+    // Neither half is visible: not the applied op's mirror, not the rejected
+    // op's outbox row, not the failure row that describes the split.
+    expect(store.getSyncRow('entries', 'episode:E1')).toBeNull()
+    expect(store.outboxDepth()).toBe(0)
+    expect(store.listFailures().some(x => /confirmed 1\/2/.test(x.reason))).toBe(false)
+
+    // And that state is the RECOVERABLE one: local state makes no claim about
+    // E1 at all, so the next sync/pull -- which is putSyncRows, exactly this --
+    // learns it from the server rather than being told it is already done.
+    store.putSyncRows('entries', [{ pk: 'episode:E1', row: { entityKind: 'episode', entityId: 'E1', watched: true, plays: 1, deletedAt: null } }])
+    expect(store.getSyncRow('entries', 'episode:E1')).toMatchObject({ watched: true })
+  })
+
   it('does not queue anything under dry run, where nothing was attempted', async () => {
     const f = ok()
     expect(await submit(mkDry(f), createGate(), [OP('1')])).toBe('sent')
@@ -269,6 +310,85 @@ describe('gate halts are notified, whichever call saw the 401', () => {
 })
 
 // Binge behaviour: the mirror otherwise only refreshes every 30 minutes.
+// RR1. markApplied and mirrorApplied describe ONE event, and ran in separate
+// transactions with the reschedule loop between them. A crash in that gap left
+// the op no longer `pending` while sync_state still held the PRE-push value --
+// a rating src/ratings/toPlex.ts then reads as a deliberate bingers-side change
+// and writes back over the plex value it came from.
+describe('flushOutbox marks and mirrors atomically (RR1)', () => {
+  it('rolls the applied-mark back when the mirror write fails, rather than leaving half-updated state', async () => {
+    store.enqueueOps([RATING_OP('r1', 'E1', 4)])
+    expect(store.outboxDepth()).toBe(1)
+    // The mirror's own write fails partway through the pair. `tx` is the real
+    // store method, so only putSyncRows is broken -- exactly the shape of a
+    // crash between the two.
+    const deps = { ...mk(ok()), store: { ...store, putSyncRows: () => { throw new Error('disk full') } } }
+    await flushOutbox(deps as any, createGate())
+
+    // Neither half may have landed. Applied-but-unmirrored is the dangerous
+    // state: hasPendingRatingOp would go false over a stale mirror.
+    expect(store.outboxDepth()).toBe(1)
+    expect(store.getSyncRow('entries', 'episode:E1')).toBeNull()
+    expect(store.hasPendingRatingOp('episode', 'E1')).toBe(true)
+  })
+})
+
+// RR3. flushOutbox had no cap, so an op bingers permanently rejects stayed
+// `pending` forever. Since Layer 1 consults hasPendingRatingOp(), that is a
+// PERMANENT LOCKOUT of the entity from the bingers->plex direction, not merely
+// wasted work.
+describe('an op bingers keeps rejecting is abandoned, not retried forever (RR3)', () => {
+  // A 200 whose `results` confirm nothing: the server answered and refused.
+  const rejectsEverything = () => vi.fn(async () =>
+    new Response(JSON.stringify({ results: [], rows: {} }), { status: 200 }))
+  const makeDue = (opId: string) => store.reschedule(opId, new Date(0).toISOString())
+
+  it('moves it to a terminal status past the cap and records a failure naming it', async () => {
+    store.enqueueOps([RATING_OP('r1', 'E1', 4)])
+    const deps = mk(rejectsEverything())
+    const gate = createGate()
+    for (let i = 0; i < MAX_OP_REJECTIONS; i++) { makeDue('r1'); await flushOutbox(deps, gate) }
+
+    expect(store.outboxDepth()).toBe(0)
+    expect(store.abandonedDepth()).toBe(1) // terminal, NOT deleted: still inspectable
+    const failure = store.listFailures().find(x => /abandoned after/.test(x.reason))
+    expect(failure).toBeDefined()
+    expect(failure!.reason).toContain('r1')
+    expect(JSON.parse(failure!.payload)).toMatchObject({ opId: 'r1', pk: { entityId: 'E1' } })
+  })
+
+  it('releases the entity lockout that kept a genuine bingers rating from reaching plex', async () => {
+    store.enqueueOps([RATING_OP('r1', 'E1', 4)])
+    expect(store.hasPendingRatingOp('episode', 'E1')).toBe(true)
+    const deps = mk(rejectsEverything())
+    const gate = createGate()
+    for (let i = 0; i < MAX_OP_REJECTIONS; i++) { makeDue('r1'); await flushOutbox(deps, gate) }
+    expect(store.hasPendingRatingOp('episode', 'E1')).toBe(false)
+  })
+
+  // The budget is spent by REJECTIONS, not by `attempts`, which also ticks for
+  // transport failures. Counting the shared `attempts` column would let a long
+  // outage exhaust the budget, so the FIRST time bingers actually answered and
+  // refused the op it would be abandoned on the spot -- discarding a write
+  // that was never shown to be unacceptable.
+  it('does not let an outage spend the budget: a first real rejection after many transport failures still retries', async () => {
+    store.enqueueOps([RATING_OP('r1', 'E1', 4)])
+    const gate = createGate()
+    for (let i = 0; i < MAX_OP_REJECTIONS + 2; i++) { makeDue('r1'); await flushOutbox(mk(boom(500)), gate) }
+    // The outage alone abandons nothing, and has run `attempts` well past the cap.
+    expect(store.outboxDepth()).toBe(1)
+    expect(store.abandonedDepth()).toBe(0)
+    expect(store.attemptsFor('r1')).toBeGreaterThanOrEqual(MAX_OP_REJECTIONS)
+
+    // Bingers comes back and refuses it ONCE. One refusal is not a pattern.
+    makeDue('r1')
+    await flushOutbox(mk(rejectsEverything()), gate)
+    expect(store.outboxDepth()).toBe(1)
+    expect(store.abandonedDepth()).toBe(0)
+    expect(store.listFailures().some(x => /abandoned after/.test(x.reason))).toBe(false)
+  })
+})
+
 describe('optimistic local mirror', () => {
   it('records a confirmed entries write in sync_state immediately', async () => {
     await submit(mk(ok()), createGate(), [OP('1')])
@@ -284,6 +404,67 @@ describe('optimistic local mirror', () => {
   it('records nothing under dry run', async () => {
     await submit(mkDry(ok()), createGate(), [OP('1')])
     expect(store.getSyncRow('entries', 'episode:E1')).toBeNull()
+  })
+
+  // The other half of the reverse-sync round trip: when the forward path
+  // unfollows a title (pulsarr saw it leave the plex watchlist), the mirrored
+  // delete must also drop the plex_link, or re-following the title later leaves
+  // it permanently invisible to the reverse queue.
+  it('drops the plex_link when a confirmed unfollow is mirrored', async () => {
+    store.putPlexLink({ titleId: 'T1', ratingKey: 'k', state: 'added', attempts: 0, nextTryAt: null })
+    const del = { opId: 'd1', table: 'follows' as const, pk: { titleId: 'T1' }, deleted: true as const }
+    await submit(mk(ok()), createGate(), [del] as any)
+    expect(store.getSyncRow('follows', 'T1')).toMatchObject({ titleId: 'T1' })
+    expect(store.getPlexLink('T1')).toBeNull()
+  })
+
+  // Fix round 1: a rating-only entries op must never invent a watched flag.
+  it('a rating-only push with no prior mirror row leaves the entry NOT watched', async () => {
+    await submit(mk(ok()), createGate(), [RATING_OP('r1', 'ER1', 5)])
+    const row = store.getSyncRow('entries', 'episode:ER1') as any
+    // The same condition handlers.ts's alreadyWatched() tests: watched must
+    // be strictly === true, and a missing key must read as "not watched".
+    expect(row?.watched === true).toBe(false)
+    expect(row.rating).toBe(5)
+  })
+
+  it('a rating-only push onto an already-watched entry keeps it watched, with its original plays intact', async () => {
+    await submit(mk(ok()), createGate(), [OP('w2')]) // watched: true, plays: 1, entityId Ew2
+    await submit(mk(ok()), createGate(), [RATING_OP('r2', 'Ew2', 4)])
+    const row = store.getSyncRow('entries', 'episode:Ew2') as any
+    expect(row.watched).toBe(true)
+    expect(row.plays).toBe(1)
+    expect(row.rating).toBe(4)
+  })
+
+  it('a normal watched push still mirrors watched:true with the right plays', async () => {
+    const op = {
+      opId: 'w3', table: 'entries' as const,
+      pk: { entityKind: 'episode' as const, entityId: 'Ew3' },
+      fields: { watched: true as const, plays: 7, batchId: null },
+    }
+    await submit(mk(ok()), createGate(), [op])
+    const row = store.getSyncRow('entries', 'episode:Ew3') as any
+    expect(row.watched).toBe(true)
+    expect(row.plays).toBe(7)
+  })
+
+  // Fix round 2, Ruling D: a watched op and a rating op for the same entity
+  // landing in ONE applied batch (reachable via flushOutbox after a gate
+  // halt) must merge in-memory, not via a getSyncRow read that predates the
+  // batch -- otherwise whichever op is processed second either erases the
+  // other's fields (a fresh watched row has no `rating` key) or is itself
+  // built from a stale pre-batch read (a rating op reading `getSyncRow`
+  // before the watched op in the SAME batch has flushed anything). Both
+  // orderings are exercised in one applied array, on two different entities.
+  it('merges a watched op and a rating op for the same entity within one applied batch, regardless of order', async () => {
+    const ops = [
+      WATCHED_OP('a1', 'EA', 3), RATING_OP('a2', 'EA', 5), // watched then rating
+      RATING_OP('b1', 'EB', 4), WATCHED_OP('b2', 'EB', 7), // rating then watched
+    ]
+    await submit(mk(ok()), createGate(), ops)
+    expect(store.getSyncRow('entries', 'episode:EA')).toMatchObject({ watched: true, plays: 3, rating: 5 })
+    expect(store.getSyncRow('entries', 'episode:EB')).toMatchObject({ watched: true, plays: 7, rating: 4 })
   })
 })
 

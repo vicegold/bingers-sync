@@ -16,7 +16,12 @@ export type ResolveFailure = { failure: string; retryable?: true; details?: unkn
 
 const SOURCES = ['tmdb', 'tvdb', 'imdb'] as const
 
-function intersects(a: ExternalIds, b: Record<string, string>): boolean {
+// Exported so every caller that needs "do these two id sets denote the same
+// thing" (src/ratings/toPlex.ts's show-ratingKey verification included)
+// shares this one definition rather than restating it -- two drifting
+// copies of "is this the same thing" would be a worse bug than any of the
+// bugs a second, stricter copy might prevent.
+export function intersects(a: ExternalIds, b: Record<string, string>): boolean {
   return SOURCES.some(s => a[s] != null && b[s] != null && String(a[s]) === b[s])
 }
 
@@ -45,6 +50,15 @@ export async function resolveTitle(
     if (hit) return { titleId: hit }
   }
 
+  // Deliberately NOT marked retryable, and that is now load-bearing rather
+  // than cosmetic: src/ratings/fromPlex.ts treats an unflagged failure as a
+  // CONFIRMED no-match and marks the item unratable. It is correct here --
+  // the caller supplied no ids at all, which is a complete answer about the
+  // request, not a failure to check anything, and retrying the identical
+  // argument cannot change it. fromPlex never reaches this: it returns early
+  // on an empty id set (`Object.keys(ids).length === 0` -> `unresolved`)
+  // before calling resolveTitle, because an empty Plex Guid array IS a
+  // server-side condition that can change.
   if (!SOURCES.some(s => args.ids[s])) return { failure: 'no external ids supplied' }
 
   for (let page = 0; page < searchMaxPages; page++) {
@@ -52,7 +66,15 @@ export async function resolveTitle(
     try {
       results = await searchTitles(args.title, page, fetchImpl)
     } catch (e) {
-      return { failure: `search failed: ${(e as Error).message}` }
+      // RETRYABLE, and it matters: the search never ran, so nothing here
+      // shows whether a match exists. Unflagged, a caller honouring this
+      // flag (src/ratings/fromPlex.ts) would read a network blip as a
+      // confirmed no-match and permanently mark the item unratable.
+      return {
+        failure: `search failed: ${(e as Error).message}`,
+        retryable: true,
+        details: { title: args.title, kind: args.kind, ids: args.ids, page },
+      }
     }
     if (results.length === 0) break
 
@@ -224,4 +246,27 @@ export async function resolveEpisode(
     }
   }
   return { failure: `no episode S${args.season}E${args.number} for title ${args.titleId}` }
+}
+
+export async function titleExternalIds(
+  deps: ResolveDeps, titleId: string, kind: string,
+): Promise<{ ids: ExternalIds; title: string | null; year: number | null } | ResolveFailure> {
+  const cached = deps.store.externalIdsFor(titleId)
+  if (Object.keys(cached.ids).length > 0) {
+    return { ids: cached.ids as ExternalIds, title: cached.title, year: cached.year }
+  }
+  const fetchImpl = deps.fetchImpl ?? fetch
+  try {
+    const files = await fetchVersions(titleId, fetchImpl)
+    const meta = await fetchMetadata(titleId, files.metadata, fetchImpl)
+    const ids = externalIdMap(meta)
+    if (Object.keys(ids).length > 0) {
+      deps.store.putTitleMapping(Object.entries(ids).map(([source, extId]) => ({
+        source, extId, kind, titleId, title: meta.title ?? null, year: meta.year ?? null,
+      })))
+    }
+    return { ids: ids as ExternalIds, title: meta.title ?? null, year: meta.year ?? null }
+  } catch (e) {
+    return { failure: `catalog lookup failed for ${titleId}: ${(e as Error).message}`, retryable: true }
+  }
 }

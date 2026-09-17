@@ -9,3 +9,4 @@ data/
 # local working notes, not part of the project
 docs/
 .superpowers/
+.superset/

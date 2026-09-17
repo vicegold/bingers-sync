@@ -3,6 +3,7 @@ export type Op =
   | { opId: string; table: 'follows'; pk: { titleId: string }; fields: FollowFields }
   | { opId: string; table: 'follows'; pk: { titleId: string }; deleted: true }
   | { opId: string; table: 'entries'; pk: { entityKind: 'episode' | 'movie'; entityId: string }; fields: { watched: true; plays: number; batchId: string | null } }
+  | { opId: string; table: 'entries'; pk: { entityKind: 'episode' | 'movie'; entityId: string }; fields: { rating: number } }
 
 export type DatedWrite = { entityKind: 'episode' | 'movie'; entityId: string; watchedAt: string }
 export type Plan = { ops: Op[]; dated: DatedWrite[] }

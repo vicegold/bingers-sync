@@ -25,6 +25,20 @@ export function backoffMs(attempts: number): number {
 }
 
 /**
+ * How many EXPLICIT bingers rejections an op may collect before it is
+ * abandoned. Without a cap an op the server permanently refuses stays
+ * `pending` forever; since src/ratings/toPlex.ts's Layer 1 consults
+ * hasPendingRatingOp(), that is not merely wasted work any more -- it locks
+ * the entity out of the bingers->plex direction permanently, so the user's
+ * genuine rating is refused for good.
+ *
+ * Counted against `rejections`, not `attempts`: a transport failure means the
+ * server never answered, and an outage must not spend the budget of a write
+ * that was never actually refused.
+ */
+export const MAX_OP_REJECTIONS = 10
+
+/**
  * Close the write gate. Every path that halts goes through here so the spec's
  * "Bingers 401 -> stop writing, keep queueing, notify" holds no matter which
  * call (push, flush, or the date-correction read/patch) saw the 401.
@@ -50,27 +64,65 @@ function opIsEntry(o: Op): o is Extract<Op, { table: 'entries' }> {
 }
 
 /**
- * Mirror a confirmed write into sync_state immediately, instead of waiting up
+ * Mirror confirmed writes into sync_state immediately, instead of waiting up
  * to SYNC_PULL_INTERVAL_MIN for the next pull to tell us what we already know.
  * During a binge this is what stops every subsequent scrobble of the same show
  * from re-evaluating and re-pushing the episodes earlier scrobbles just wrote.
- * Conservative by construction: it only ever ADDS knowledge of writes we made.
+ *
+ * Each entries op is merged into an in-memory row for its pk rather than
+ * written independently: a watched op asserts watched/plays/deletedAt, a
+ * rating-only op asserts only `rating`, and neither erases what the other
+ * asserted. The row is seeded at most once per pk, lazily, from whatever
+ * `getSyncRow` returns BEFORE this batch; every op after that seed mutates
+ * the same in-memory row, so two ops for the same entity landing in one
+ * `applied` array (reachable via flushOutbox after a gate halt) end up with
+ * the union of what they asserted regardless of which one came first --
+ * never a rating op reading stale pre-batch state and clobbering a watched
+ * flag the other op in the SAME batch just confirmed.
+ *
+ * That same lazy seed also changes the single-op case, not just multi-op
+ * batches: a plain watched op, alone in its own `applied` array, used to be
+ * written as a fresh row (entityKind/entityId/watched/plays/deletedAt and
+ * nothing else), unconditionally replacing whatever was stored. It now
+ * seeds from the existing row first and merges on top, so a `rating` an
+ * earlier, separate submit() call already wrote survives a later watched-only
+ * push instead of being silently erased by it.
  */
 function mirrorApplied(deps: SyncDeps, applied: Op[]): void {
-  const entries: { pk: string; row: unknown }[] = []
+  const entryRows = new Map<string, Record<string, unknown>>()
   const follows: { pk: string; row: unknown }[] = []
+
+  function rowFor(pk: string, o: Extract<Op, { table: 'entries' }>): Record<string, unknown> {
+    let row = entryRows.get(pk)
+    if (!row) {
+      const existing = deps.store.getSyncRow('entries', pk) as Record<string, unknown> | null
+      // No prior row means the identity fields are written with NO `watched`
+      // key at all: absent, not false -- alreadyWatched() tests
+      // `row.watched === true`, and a missing key honestly means "we don't know".
+      row = existing ? { ...existing } : { entityKind: o.pk.entityKind, entityId: o.pk.entityId, deletedAt: null }
+      entryRows.set(pk, row)
+    }
+    return row
+  }
+
   for (const o of applied) {
     if (opIsEntry(o)) {
-      entries.push({
-        pk: datedKey(o.pk),
-        row: { entityKind: o.pk.entityKind, entityId: o.pk.entityId, watched: true, plays: o.fields.plays, deletedAt: null },
-      })
+      const pk = datedKey(o.pk)
+      const row = rowFor(pk, o)
+      if ('watched' in o.fields) {
+        row.watched = true
+        row.plays = o.fields.plays
+        row.deletedAt = null
+      } else {
+        row.rating = o.fields.rating
+      }
     } else if ('deleted' in o) {
       follows.push({ pk: o.pk.titleId, row: { titleId: o.pk.titleId, deletedAt: new Date().toISOString() } })
     } else {
       follows.push({ pk: o.pk.titleId, row: { titleId: o.pk.titleId, kind: o.fields.kind, deletedAt: null } })
     }
   }
+  const entries = [...entryRows.entries()].map(([pk, row]) => ({ pk, row }))
   if (entries.length) deps.store.putSyncRows('entries', entries)
   if (follows.length) deps.store.putSyncRows('follows', follows)
 }
@@ -130,16 +182,32 @@ export async function submit(deps: SyncDeps, gate: Gate, ops: Op[], dated: Dated
   // until the recorded applyDates failure is replayed by hand. Reordering
   // would leave a confirmed write unmirrored on a date-correction hiccup,
   // which is worse, so this is deliberate, not an oversight.
-  if (applied.length) mirrorApplied(deps, applied)
-
-  if (rejected.length) {
-    deps.store.enqueueOps(rejected as any, dated)
-    deps.store.recordFailure(
-      'sync/push',
-      `bingers confirmed ${applied.length}/${ops.length} op(s); ${rejected.length} queued for retry`,
-      { rejected: rejected.map(o => ({ opId: o.opId, table: o.table, pk: o.pk })) },
-    )
-  }
+  // One server response, one local write. Mirroring what landed and queueing
+  // what did not are halves of the same fact, so they commit together or not
+  // at all, and local state never records only part of a response.
+  //
+  // Be precise about what that buys, because it is NOT "the rejected ops are
+  // safe". If the second half throws, those ops are gone either way -- the
+  // throw happened while queueing them, and no rollback brings back work that
+  // was never written. What the transaction adds is that the FIRST half is
+  // discarded too, so the outcome is "none of this response is recorded"
+  // rather than "the applied half is recorded and the rejected half silently
+  // is not". The first is re-derivable: sync_state is the local mirror, and
+  // the next pull (or the next scrobble for the same entity) learns the state
+  // from the server. The second is a half-truth nothing later corrects,
+  // because the mirror asserting the write landed is exactly what stops the
+  // forward path revisiting it.
+  deps.store.tx(() => {
+    if (applied.length) mirrorApplied(deps, applied)
+    if (rejected.length) {
+      deps.store.enqueueOps(rejected as any, dated)
+      deps.store.recordFailure(
+        'sync/push',
+        `bingers confirmed ${applied.length}/${ops.length} op(s); ${rejected.length} queued for retry`,
+        { rejected: rejected.map(o => ({ opId: o.opId, table: o.table, pk: o.pk })) },
+      )
+    }
+  })
 
   const appliedDated = dated.filter(d => applied.some(o => opIsEntry(o) && datedKey(o.pk) === datedKey(d)))
   await correctDates(deps, gate, appliedDated)
@@ -168,15 +236,46 @@ export async function flushOutbox(deps: SyncDeps, gate: Gate): Promise<number> {
     // Read the intended watch times BEFORE markApplied, so the lookup never
     // depends on how an applied row is retained.
     const watchedAt = deps.store.watchedAtFor(applied.map(o => o.opId))
-    if (applied.length) deps.store.markApplied(applied.map(o => o.opId))
+
+    // markApplied and mirrorApplied describe ONE event -- "these ops landed"
+    // -- and the mirror exists precisely so local state matches what the
+    // server was told. Run in separate transactions (with the reschedule loop
+    // between them, as they were) a crash in the gap left the op no longer
+    // `pending` while sync_state still held the PRE-push value: a rating
+    // src/ratings/toPlex.ts would then read as a deliberate bingers-side
+    // change and write back over the plex value it came from. The transaction
+    // covers mirrorApplied's getSyncRow READ as well as its write, so a
+    // concurrent writer cannot interleave between the two.
+    //
+    // Same known ordering trade-off as in submit() above: this runs before
+    // correctDates, so a date-correction failure below leaves the push-time
+    // date on a row sync_state already marks watched.
+    if (applied.length) {
+      deps.store.tx(() => {
+        deps.store.markApplied(applied.map(o => o.opId))
+        mirrorApplied(deps, applied as Op[])
+      })
+    }
+
     for (const o of rejected) {
+      // An explicit refusal, not a transport failure -- see MAX_OP_REJECTIONS.
+      deps.store.recordRejection(o.opId)
+      if (deps.store.rejectionsFor(o.opId) >= MAX_OP_REJECTIONS) {
+        // Terminal, and recorded in full rather than silently dropped: the
+        // op leaves `pending` so it stops being retried and stops locking its
+        // entity out of the bingers->plex direction, and the failure row
+        // carries everything needed to replay it by hand.
+        deps.store.abandonOp(o.opId)
+        deps.store.recordFailure(
+          'outbox',
+          `op ${o.opId} abandoned after ${MAX_OP_REJECTIONS} bingers rejection(s): ${o.table} ${JSON.stringify(o.pk)}`,
+          { opId: o.opId, table: o.table, pk: o.pk, fields: (o as any).fields ?? null },
+        )
+        continue
+      }
       const next = new Date(Date.now() + backoffMs(deps.store.attemptsFor(o.opId))).toISOString()
       deps.store.reschedule(o.opId, next)
     }
-    // Same known ordering trade-off as in submit() above: mirrorApplied runs
-    // before correctDates, so a date-correction failure below leaves the
-    // push-time date on a row sync_state already marks watched.
-    if (applied.length) mirrorApplied(deps, applied as Op[])
 
     // The dated half of the original Plan, restored from the outbox: without
     // this a flush lands every backfilled episode stamped with flush time.
