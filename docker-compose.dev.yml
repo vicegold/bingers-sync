@@ -1,0 +1,17 @@
+# Build and run from source. Standalone -- does not read docker-compose.yml:
+#
+#   docker compose -f docker-compose.dev.yml up -d --build
+services:
+    bingers-sync:
+        build: .
+        restart: unless-stopped
+        environment:
+            - PLEX_URL=http://192.168.x.x:32400 # plex base url, use the LAN ip not a hostname
+            - PLEX_TOKEN= # plex api token
+            - ALLOWED_USER= # whose activity to sync, everyone else is ignored
+            - DRY_RUN=true # log writes instead of sending them, only "false" disables it
+            # every other setting from docker-compose.yml works here too
+        volumes:
+            - ./data:/data
+        ports:
+            - 8787:8787

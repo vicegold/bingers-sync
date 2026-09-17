@@ -17,8 +17,10 @@ nothing to copy or template first.
    mount) or the outbox will not survive a restart.
 
 2. **`docker compose up -d`.** This pulls `ghcr.io/vicegold/bingers-sync:latest`,
-   which CI publishes on every push to main. To build from source instead:
-   `docker compose --profile dev up -d --build bingers-sync-dev`
+   which CI publishes on every push to main.
+
+   To build from source instead:
+   `docker compose -f docker-compose.dev.yml up -d --build`
 
 3. **Open `http://<host-ip>:8787/setup` and connect to Bingers.** In the Bingers
    app, request a magic link, then **copy the link out of the email instead of
