@@ -1,7 +1,9 @@
 import { describe, it, expect, vi } from 'vitest'
 import { fetchShowIds, fetchAllLeaves, parseGuids } from '../src/plex/client.js'
 
-const deps = (f: any) => ({ plexUrl: 'http://plex.local:32400', plexToken: 'tok', fetchImpl: f as typeof fetch })
+// retryDelayMs 0 throughout: the retry SCHEDULE is not what these assert, and
+// the real default would add a second of sleeping to the suite.
+const deps = (f: any) => ({ plexUrl: 'http://fc10:32400', plexToken: 'tok', fetchImpl: f as typeof fetch, retryDelayMs: 0 })
 const stub = (body: unknown) => vi.fn(async () => new Response(JSON.stringify(body), { status: 200 }))
 
 describe('parseGuids', () => {
@@ -23,7 +25,7 @@ describe('fetchShowIds', () => {
     const ids = await fetchShowIds(deps(f), '90363')
     expect(ids).toEqual({ tmdb: '247522', tvdb: '446718' })
     const [url, init] = (f as any).mock.calls[0]
-    expect(url).toBe('http://plex.local:32400/library/metadata/90363?includeGuids=1')
+    expect(url).toBe('http://fc10:32400/library/metadata/90363?includeGuids=1')
     expect(init.headers['X-Plex-Token']).toBe('tok')
   })
 
@@ -46,7 +48,7 @@ describe('fetchAllLeaves', () => {
       { ratingKey: '90366', parentIndex: 1, index: 3, viewCount: 2, lastViewedAt: 1789553428, title: 'Sales Contest', userRating: 9 },
     ] } })
     const eps = await fetchAllLeaves(deps(f), '90363')
-    expect((f as any).mock.calls[0][0]).toBe('http://plex.local:32400/library/metadata/90363/allLeaves')
+    expect((f as any).mock.calls[0][0]).toBe('http://fc10:32400/library/metadata/90363/allLeaves')
     expect(eps).toHaveLength(3)
     expect(eps[1]).toEqual({ season: 1, number: 2, viewCount: 0, lastViewedAt: null, title: 'Unwatched', ratingKey: '90365', userRating: null })
     expect(eps[2]).toEqual({ season: 1, number: 3, viewCount: 2, lastViewedAt: 1789553428, title: 'Sales Contest', ratingKey: '90366', userRating: 9 })
@@ -71,5 +73,54 @@ describe('fetchAllLeaves', () => {
     const eps = await fetchAllLeaves(deps(f), '90363')
     expect(eps).toHaveLength(1)
     expect(eps[0]!.title).toBe('Has ratingKey')
+  })
+})
+
+describe('plexGet transport', () => {
+  const ok = { MediaContainer: { Metadata: [{ Guid: [{ id: 'tmdb://5' }] }] } }
+
+  it('reports the underlying cause of a network failure, not just "fetch failed"', async () => {
+    const f = vi.fn(async () => {
+      throw Object.assign(new TypeError('fetch failed'), { cause: new Error('getaddrinfo ENOTFOUND fc10') })
+    })
+    await expect(fetchShowIds(deps(f), '1')).rejects.toThrow(/getaddrinfo ENOTFOUND fc10/)
+  })
+
+  it('retries a transient network failure and returns the eventual success', async () => {
+    let n = 0
+    const f = vi.fn(async () => {
+      if (++n < 3) throw new TypeError('fetch failed')
+      return new Response(JSON.stringify(ok), { status: 200 })
+    })
+    expect(await fetchShowIds(deps(f), '1')).toEqual({ tmdb: '5' })
+    expect(f).toHaveBeenCalledTimes(3)
+  })
+
+  it('retries a 5xx, which is the server having a moment rather than an answer', async () => {
+    let n = 0
+    const f = vi.fn(async () => ++n < 3
+      ? new Response('busy', { status: 503 })
+      : new Response(JSON.stringify(ok), { status: 200 }))
+    expect(await fetchShowIds(deps(f), '1')).toEqual({ tmdb: '5' })
+    expect(f).toHaveBeenCalledTimes(3)
+  })
+
+  it('does not retry a 4xx, which says the same thing however often it is asked', async () => {
+    const f = vi.fn(async () => new Response('bad token', { status: 401 }))
+    await expect(fetchShowIds(deps(f), '1')).rejects.toThrow(/401/)
+    expect(f).toHaveBeenCalledTimes(1)
+  })
+
+  it('says how many attempts it made before giving up', async () => {
+    const f = vi.fn(async () => { throw new TypeError('fetch failed') })
+    await expect(fetchShowIds(deps(f), '1')).rejects.toThrow(/\(3 attempts\) -> fetch failed/)
+    expect(f).toHaveBeenCalledTimes(3)
+  })
+
+  it('abandons an attempt that outruns the timeout instead of hanging on it', async () => {
+    const f = vi.fn((_url: any, init: any) => new Promise((_res, rej) => {
+      init.signal.addEventListener('abort', () => rej(init.signal.reason))
+    }))
+    await expect(fetchShowIds({ ...deps(f), timeoutMs: 10, attempts: 1 }, '1')).rejects.toThrow(/timeout/i)
   })
 })

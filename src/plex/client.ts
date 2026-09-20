@@ -1,9 +1,38 @@
 import type { ExternalIds } from '../resolve.js'
 
-export type PlexDeps = { plexUrl: string; plexToken: string; fetchImpl?: typeof fetch }
+export type PlexDeps = {
+  plexUrl: string; plexToken: string; fetchImpl?: typeof fetch
+  // Transport tuning. Defaulted rather than configured: these are properties of
+  // "a LAN Plex server that answers in milliseconds", not of a deployment.
+  timeoutMs?: number; attempts?: number; retryDelayMs?: number
+}
+
 export type PlexEpisode = {
   season: number; number: number; viewCount: number; lastViewedAt: number | null
   title: string | null; ratingKey: string; userRating: number | null
+}
+
+// Plex is on the LAN and answers in milliseconds; anything still outstanding
+// after this is a connection that will never complete, and without a deadline
+// fetch would wait on it indefinitely while the webhook handler blocks.
+const DEFAULT_TIMEOUT_MS = 5_000
+const DEFAULT_ATTEMPTS = 3
+const DEFAULT_RETRY_DELAY_MS = 250
+
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+/**
+ * undici collapses every network-level failure -- DNS, refused, reset, TLS,
+ * timeout -- into the one message "fetch failed", and hangs the only usable
+ * detail off .cause. Unwrapped, an unreachable host and a wrong port are the
+ * same string in the failures table, which is how a dropped watch becomes
+ * undiagnosable after the fact.
+ */
+export function describeError(e: unknown): string {
+  const err = e as { message?: string; cause?: unknown } | null
+  const msg = err?.message || String(e)
+  const cause = (err?.cause ?? null) as { message?: string } | null
+  return cause?.message && !msg.includes(cause.message) ? `${msg} (${cause.message})` : msg
 }
 
 const SCHEMES = new Set(['tmdb', 'tvdb', 'imdb'])
@@ -21,11 +50,37 @@ export function parseGuids(guids: { id: string }[] | undefined): ExternalIds {
 
 async function plexGet<T>(deps: PlexDeps, path: string): Promise<T> {
   const fetchImpl = deps.fetchImpl ?? fetch
-  const res = await fetchImpl(`${deps.plexUrl}${path}`, {
-    headers: { 'X-Plex-Token': deps.plexToken, Accept: 'application/json' },
-  })
-  if (!res.ok) throw new Error(`plex GET ${path} -> ${res.status}`)
-  return (await res.json()) as T
+  const attempts = Math.max(1, deps.attempts ?? DEFAULT_ATTEMPTS)
+  const retryDelayMs = deps.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  // A plex scrobble arrives exactly once and is never replayed: a blip that
+  // reaches here unretried costs a watch record permanently.
+  let detail: string | undefined
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let res: Response
+    try {
+      res = await fetchImpl(`${deps.plexUrl}${path}`, {
+        headers: { 'X-Plex-Token': deps.plexToken, Accept: 'application/json' },
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+    } catch (e) {
+      detail = describeError(e)
+      if (attempt < attempts) await sleep(retryDelayMs * attempt)
+      continue
+    }
+    if (res.ok) return (await res.json()) as T
+    // Only 5xx is worth asking again. A 401 (bad token) or 404 (unknown
+    // ratingKey) is plex's answer, not plex having a moment, and repeating it
+    // just delays the failure the caller has to record anyway.
+    if (res.status < 500) throw new Error(`plex GET ${path} -> ${res.status}`)
+    detail = String(res.status)
+    if (attempt < attempts) await sleep(retryDelayMs * attempt)
+  }
+  // What went wrong goes LAST, after the arrow, and the attempt count before
+  // it. fromPlex keys one plex outage by that tail, so the per-request path
+  // has to stay in front of it: appended after, it would split a single
+  // outage into one incident per path. See incidentKey in ratings/fromPlex.
+  throw new Error(`plex GET ${path}${attempts > 1 ? ` (${attempts} attempts)` : ''} -> ${detail}`)
 }
 
 export async function fetchShowIds(deps: PlexDeps, ratingKey: string): Promise<ExternalIds> {

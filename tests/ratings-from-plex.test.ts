@@ -296,6 +296,28 @@ describe('syncRatingsFromPlex', () => {
       expect(rows.some(x => /404/.test(x.reason))).toBe(true)
     })
 
+    // The transport half of the same rule. Every poll dies identically and
+    // none of them got a response, so there is no status to key on -- but one
+    // unreachable plex is still ONE incident, however many polls it blocked.
+    // Held only by accident before plexGet reported the cause: every failure
+    // was the same generic "fetch failed" string.
+    it('counts an outage that never reached plex as one incident', async () => {
+      const f = vi.fn(async (url: string) => {
+        if (/library\/sections$/.test(url)) return new Response(JSON.stringify(SECTIONS[1]), { status: 200 })
+        throw Object.assign(new TypeError('fetch failed'), { cause: new Error('getaddrinfo ENOTFOUND fc10') })
+      })
+      vi.useFakeTimers()
+      try {
+        const p = syncRatingsFromPlex(deps(f))
+        await vi.runAllTimersAsync() // plexGet backs off between attempts
+        const r = await p
+        expect(r.failed).toBe(1)
+        const rows = store.listFailures().filter(x => /rating poll failed/.test(x.reason))
+        expect(rows).toHaveLength(1)
+        expect(rows[0]!.reason).toMatch(/ENOTFOUND fc10/) // and it says what went wrong
+      } finally { vi.useRealTimers() }
+    })
+
     it('notifies about one failure, not one per blocked poll', async () => {
       const { f, calls } = router([SECTIONS])
       await syncRatingsFromPlex({ ...deps(f), config: cfg({ NOTIFY_URL: 'http://hook' }) })
