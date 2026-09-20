@@ -3,7 +3,7 @@ import { loadConfig } from '../src/config.js'
 
 const base = {
   BINGERS_SESSION_COOKIE: 'tok',
-  PLEX_URL: 'http://plex.local:32400',
+  PLEX_URL: 'http://fc10:32400',
   PLEX_TOKEN: 'plex',
   ALLOWED_USER: 'testuser',
 }
@@ -29,11 +29,11 @@ describe('loadConfig', () => {
   })
 
   it('strips trailing slashes from PLEX_URL', () => {
-    expect(loadConfig({ ...base, PLEX_URL: 'http://plex.local:32400/' } as NodeJS.ProcessEnv).plexUrl).toBe(
-      'http://plex.local:32400',
+    expect(loadConfig({ ...base, PLEX_URL: 'http://fc10:32400/' } as NodeJS.ProcessEnv).plexUrl).toBe(
+      'http://fc10:32400',
     )
-    expect(loadConfig({ ...base, PLEX_URL: 'http://plex.local:32400///' } as NodeJS.ProcessEnv).plexUrl).toBe(
-      'http://plex.local:32400',
+    expect(loadConfig({ ...base, PLEX_URL: 'http://fc10:32400///' } as NodeJS.ProcessEnv).plexUrl).toBe(
+      'http://fc10:32400',
     )
   })
 

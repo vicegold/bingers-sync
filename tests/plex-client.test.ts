@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import { fetchShowIds, fetchAllLeaves, parseGuids } from '../src/plex/client.js'
 
-const deps = (f: any) => ({ plexUrl: 'http://plex.local:32400', plexToken: 'tok', fetchImpl: f as typeof fetch })
+const deps = (f: any) => ({ plexUrl: 'http://fc10:32400', plexToken: 'tok', fetchImpl: f as typeof fetch })
 const stub = (body: unknown) => vi.fn(async () => new Response(JSON.stringify(body), { status: 200 }))
 
 describe('parseGuids', () => {
@@ -23,7 +23,7 @@ describe('fetchShowIds', () => {
     const ids = await fetchShowIds(deps(f), '90363')
     expect(ids).toEqual({ tmdb: '247522', tvdb: '446718' })
     const [url, init] = (f as any).mock.calls[0]
-    expect(url).toBe('http://plex.local:32400/library/metadata/90363?includeGuids=1')
+    expect(url).toBe('http://fc10:32400/library/metadata/90363?includeGuids=1')
     expect(init.headers['X-Plex-Token']).toBe('tok')
   })
 
@@ -46,7 +46,7 @@ describe('fetchAllLeaves', () => {
       { ratingKey: '90366', parentIndex: 1, index: 3, viewCount: 2, lastViewedAt: 1789553428, title: 'Sales Contest', userRating: 9 },
     ] } })
     const eps = await fetchAllLeaves(deps(f), '90363')
-    expect((f as any).mock.calls[0][0]).toBe('http://plex.local:32400/library/metadata/90363/allLeaves')
+    expect((f as any).mock.calls[0][0]).toBe('http://fc10:32400/library/metadata/90363/allLeaves')
     expect(eps).toHaveLength(3)
     expect(eps[1]).toEqual({ season: 1, number: 2, viewCount: 0, lastViewedAt: null, title: 'Unwatched', ratingKey: '90365', userRating: null })
     expect(eps[2]).toEqual({ season: 1, number: 3, viewCount: 2, lastViewedAt: 1789553428, title: 'Sales Contest', ratingKey: '90366', userRating: 9 })
