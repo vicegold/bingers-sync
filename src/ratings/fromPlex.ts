@@ -74,15 +74,16 @@ export async function syncRatingsFromPlex(deps: RatingDeps): Promise<RatingSyncR
   //
   // Deduplicated per INCIDENT, not per run: a run-level flag would swallow a
   // second, genuinely different failure entirely -- neither counted nor
-  // recorded. plexGet's message is `plex GET <path> -> <status>` and the path
-  // is per-request by construction, so the status is what actually
-  // distinguishes one failure from another. A transport error that never got
-  // a response has no status and keys on its own message.
+  // recorded. plexGet ends its message with `-> <what went wrong>`: the status
+  // when plex answered, the transport cause when it never did. The path is
+  // per-request by construction and deliberately sits BEFORE that arrow, so
+  // the tail is what actually distinguishes one failure from another -- and
+  // one unreachable plex keys the same for every poll it blocked.
   const pollIncidents = new Set<string>()
   const incidentKey = (e: unknown) => {
     const msg = (e as Error).message
-    const m = /-> (\d+)$/.exec(msg)
-    return m ? `http ${m[1]}` : msg
+    const m = /-> (.+)$/.exec(msg)
+    return m ? m[1]! : msg
   }
 
   // A confirmed no-match is terminal for the cursor, not terminal forever --
