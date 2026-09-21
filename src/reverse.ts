@@ -1,7 +1,7 @@
 import type { Config } from './config.js'
 import type { Store } from './store.js'
 import { titleExternalIds } from './resolve.js'
-import { searchDiscover, discoverIds, addToWatchlist, removeFromWatchlist, type DiscoverCandidate } from './plex/discover.js'
+import { searchDiscover, discoverIds, addToWatchlist, removeFromWatchlist, fetchWatchlistKeys, type DiscoverCandidate } from './plex/discover.js'
 import { notify } from './notify.js'
 
 export type ReverseDeps = { config: Config; store: Store; fetchImpl?: typeof fetch }
@@ -30,14 +30,38 @@ function intersects(a: Record<string, string | undefined>, b: Record<string, str
 
 export async function reconcileWatchlist(
   deps: ReverseDeps,
-): Promise<{ added: number; removed: number; unresolved: number; skipped: number; deferred: number }> {
-  const out = { added: 0, removed: 0, unresolved: 0, skipped: 0, deferred: 0 }
+): Promise<{ added: number; removed: number; preexisting: number; unresolved: number; skipped: number; deferred: number }> {
+  const out = { added: 0, removed: 0, preexisting: 0, unresolved: 0, skipped: 0, deferred: 0 }
   if (!deps.config.reverseSync) return out
 
   const cutoff = deps.config.reverseFollowedSince
   const due = deps.store.dueUnlinkedTitles(new Date().toISOString(), deps.config.reverseBatch, cutoff)
   const dd = { plexToken: deps.config.plexToken, fetchImpl: deps.fetchImpl }
   const rd = { store: deps.store, fetchImpl: deps.fetchImpl, searchMaxPages: deps.config.searchMaxPages }
+
+  // What is ALREADY on the watchlist, read once for the whole run.
+  //
+  // addToWatchlist answers 200 whether or not the title was there, so calling
+  // it proves nothing about who put it on the list -- and this service recorded
+  // every such call as its own doing. On the first real deployment 187 of 254
+  // links were titles the user had watchlisted themselves, years earlier, all
+  // of which the removal sweep considered fair game. Knowing beforehand is the
+  // only way an 'added' link can honestly mean "we added this".
+  //
+  // Skipped under DRY_RUN, which must cost plex nothing at all.
+  let onWatchlist: Set<string> | null = null
+  if (due.length && !deps.config.dryRun) {
+    try {
+      onWatchlist = await fetchWatchlistKeys(dd)
+    } catch (e) {
+      // Adding blind is exactly the defect this prevents, so an unreadable
+      // watchlist stops the add loop rather than falling back to it.
+      for (const titleId of due) await defer(deps, titleId, `watchlist read failed, not adding blind: ${(e as Error).message}`)
+      out.deferred += due.length
+      await sweepRemovals(deps, dd, cutoff, out)
+      return out
+    }
+  }
 
   for (const titleId of due) {
     const row = deps.store.getSyncRow('follows', titleId)
@@ -110,6 +134,14 @@ export async function reconcileWatchlist(
     if (!ratingKey) {
       await fail(deps, titleId, `no verified discover match for ${t.title} (${t.year}) ids=${JSON.stringify(t.ids)}`)
       out.unresolved++; continue
+    }
+
+    // Already there: record the link so we stop reconsidering it, but mark it
+    // as none of our doing so the sweep can never take it off.
+    if (onWatchlist?.has(ratingKey)) {
+      deps.store.putPlexLink({ titleId, ratingKey, state: 'preexisting', attempts: 0, nextTryAt: null })
+      console.log(`[reverse] already on your watchlist, not ours: ${t.title} (${t.year}) -> ${ratingKey}`)
+      out.preexisting++; continue
     }
 
     try {

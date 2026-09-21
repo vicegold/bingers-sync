@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { searchDiscover, discoverIds, addToWatchlist, removeFromWatchlist, ratingKeyFromGuid, DISCOVER_TIMEOUT_MS } from '../src/plex/discover.js'
+import { searchDiscover, discoverIds, addToWatchlist, removeFromWatchlist, fetchWatchlistKeys, ratingKeyFromGuid, DISCOVER_TIMEOUT_MS } from '../src/plex/discover.js'
 
 const deps = (f: any) => ({ plexToken: 'tok', fetchImpl: f as typeof fetch })
 const stub = (body: unknown, status = 200) =>
@@ -124,5 +124,39 @@ describe('removeFromWatchlist', () => {
   it('throws on a non-2xx so the caller can back off rather than drop the link', async () => {
     const f = stub({}, 503)
     await expect(removeFromWatchlist(deps(f), 'k')).rejects.toThrow(/503/)
+  })
+})
+
+describe('fetchWatchlistKeys', () => {
+  const page = (keys: string[], totalSize: number) =>
+    new Response(JSON.stringify({ MediaContainer: { totalSize, Metadata: keys.map(k => ({ ratingKey: k })) } }), { status: 200 })
+
+  it('returns the ratingKeys already on the watchlist', async () => {
+    const f = vi.fn(async () => page(['a', 'b'], 2))
+    expect(await fetchWatchlistKeys(deps(f))).toEqual(new Set(['a', 'b']))
+    const [url, init] = (f as any).mock.calls[0]
+    expect(url).toMatch(/discover\.provider\.plex\.tv\/library\/sections\/watchlist\/all/)
+    expect(init.headers['X-Plex-Token']).toBe('tok')
+  })
+
+  // The listing paginates at 20 by default and a real watchlist runs to
+  // hundreds: stopping at the first page would report most of it as absent,
+  // which is exactly the wrong answer for "is this already there?".
+  it('pages until it has the whole watchlist', async () => {
+    let call = 0
+    const f = vi.fn(async () => (call++ === 0 ? page(['a', 'b'], 4) : page(['c', 'd'], 4)))
+    expect(await fetchWatchlistKeys(deps(f))).toEqual(new Set(['a', 'b', 'c', 'd']))
+    expect(f).toHaveBeenCalledTimes(2)
+  })
+
+  it('stops instead of looping when a page comes back empty', async () => {
+    const f = vi.fn(async () => page([], 999))
+    expect(await fetchWatchlistKeys(deps(f))).toEqual(new Set())
+    expect(f).toHaveBeenCalledTimes(1)
+  })
+
+  it('throws on a non-2xx rather than reporting an empty watchlist', async () => {
+    const f = vi.fn(async () => new Response('nope', { status: 500 }))
+    await expect(fetchWatchlistKeys(deps(f))).rejects.toThrow(/500/)
   })
 })
