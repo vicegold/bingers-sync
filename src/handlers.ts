@@ -5,7 +5,7 @@ import type { Auth } from './bingers/auth.js'
 import type { PlexScrobble, PulsarrEvent } from './routes/parse.js'
 import { resolveTitle, resolveEpisode, type ExternalIds, type ResolveFailure } from './resolve.js'
 import { fetchShowIds, fetchAllLeaves, parseGuids } from './plex/client.js'
-import { planScrobble, planWatchlist } from './plan.js'
+import { planScrobble, planWatchlist, type FollowState, type EntryState } from './plan.js'
 import { type SyncDeps } from './bingers/sync.js'
 import { submit, type Gate } from './outbox.js'
 import { notify } from './notify.js'
@@ -91,16 +91,43 @@ export function syncDeps(d: AppDeps): SyncDeps {
   }
 }
 
-function isFollowed(store: Store, titleId: string): boolean {
+/**
+ * The follow row as planScrobble wants it: null when the title is not followed,
+ * otherwise which parked states it is in.
+ *
+ * This is the ONLY place the push/pull asymmetry is resolved. A push asserts
+ * `forLater`/`stopped` as booleans; a pull reports `forLaterAt` /
+ * `stoppedWatchingAt` as nullable timestamps. Reading the boolean name off a
+ * pulled row yields undefined for every show, which reads as "not parked" and
+ * makes the revive silently never happen -- so the conversion is named, tested
+ * against a real timestamp, and not repeated anywhere else.
+ */
+function followState(store: Store, titleId: string): FollowState | null {
   const row = store.getSyncRow('follows', titleId)
   // A row with deletedAt set counts as NOT followed: a scrobble re-follows a
   // title you removed, matching the app's own "add to your list?" prompt.
-  return !!row && !row.deletedAt
+  if (!row || row.deletedAt) return null
+  return { forLater: row.forLaterAt != null, stopped: row.stoppedWatchingAt != null }
+}
+
+function isFollowed(store: Store, titleId: string): boolean {
+  return followState(store, titleId) !== null
+}
+
+/**
+ * What Bingers already records for one entity, or null if it has nothing.
+ *
+ * No push/pull translation needed here, unlike followState: entries rows report
+ * `watched` and `plays` under the same names a push asserts.
+ */
+function entryState(store: Store, entityKind: string, entityId: string): EntryState | null {
+  const row = store.getSyncRow('entries', `${entityKind}:${entityId}`)
+  if (!row || row.deletedAt) return null
+  return { watched: row.watched === true, plays: Number.isFinite(row.plays) ? Number(row.plays) : 0 }
 }
 
 function alreadyWatched(store: Store, entityKind: string, entityId: string): boolean {
-  const row = store.getSyncRow('entries', `${entityKind}:${entityId}`)
-  return !!row && row.watched === true && !row.deletedAt
+  return entryState(store, entityKind, entityId)?.watched === true
 }
 
 async function fail(d: AppDeps, source: string, reason: string, payload: unknown): Promise<HandlerResult> {
@@ -222,8 +249,9 @@ export async function handlePlex(d: AppDeps, s: PlexScrobble): Promise<HandlerRe
 
   const plan = planScrobble({
     titleId: t.titleId, kind, entityKind: s.type, entityId,
-    plays: scrobblePlays(s.viewCount), watchedAt: scrobbleWatchedAt(s.lastViewedAt),
-    isFollowed: isFollowed(d.store, t.titleId), backfill, newId,
+    plexPlays: scrobblePlays(s.viewCount), watchedAt: scrobbleWatchedAt(s.lastViewedAt),
+    follow: followState(d.store, t.titleId), entry: entryState(d.store, s.type, entityId),
+    backfill, newId,
   })
 
   // submit owns the whole write: it re-queues anything the server did not
