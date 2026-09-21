@@ -256,26 +256,45 @@ describe('plex_link', () => {
     expect(s.getPlexLink('T1')!.state).toBe('added')
   })
 
-  // Every writer of a deleted follows row -- sync/pull and the outbox mirror --
-  // goes through putSyncRows, so the link is dropped here rather than at each
-  // call site. A surviving state='added' link makes a re-followed title
-  // invisible to dueUnlinkedTitles forever while /health still counts it.
-  it('drops the link when the follow is marked deleted, and keeps it otherwise', () => {
+  // A deleted follow used to DROP the link here, which destroyed the ratingKey
+  // at exactly the moment it became necessary: an unfollowed title is one the
+  // sweep has to take BACK OFF the plex watchlist, and it cannot do that
+  // without the key. The link now survives the unfollow -- dueRemovableTitles
+  // picks it up, because an unfollowed row is not eligible -- and is dropped
+  // only once plex confirms the removal.
+  //
+  // The case the old unlink guarded (a re-followed title left invisible behind
+  // a stale 'added' link) is handled by that same sweep: the removal drops the
+  // link, and a re-follow then has none. With REVERSE_SYNC off nothing sweeps,
+  // but nothing adds either, so the watchlist is not being maintained anyway.
+  it('marks the link for removal when the follow is deleted, keeping the ratingKey', () => {
     s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null } }])
     s.putPlexLink({ titleId: 'T1', ratingKey: 'k', state: 'added', attempts: 0, nextTryAt: null })
-
-    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null } }])
-    expect(s.getPlexLink('T1')).not.toBeNull() // an ordinary refresh must not unlink
 
     s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', deletedAt: '2026-09-16T12:00:00.000Z' } }])
-    expect(s.getPlexLink('T1')).toBeNull()
-    expect(s.countPlexLinks('added')).toBe(0) // /health stops counting it too
+    expect(s.getPlexLink('T1')).toMatchObject({ state: 'remove', ratingKey: 'k' })
+    expect(s.dueRemovableTitles('2026-09-16T13:00:00.000Z', 10))
+      .toMatchObject([{ titleId: 'T1', ratingKey: 'k' }])
   })
 
-  it('does not unlink on a deleted row in another table that happens to share a pk', () => {
-    s.putPlexLink({ titleId: 'T1', ratingKey: 'k', state: 'added', attempts: 0, nextTryAt: null })
-    s.putSyncRows('entries', [{ pk: 'T1', row: { entityId: 'T1', deletedAt: '2026-09-16T12:00:00.000Z' } }])
-    expect(s.getPlexLink('T1')).not.toBeNull()
+  // The I4 round trip: reverse adds it -> you take it off the watchlist in plex
+  // -> pulsarr unfollows it on bingers -> you follow it again, all before the
+  // sweep has run. The title is already GONE from plex, so the re-follow has to
+  // re-add it; a link still reading 'added' would leave it off forever. That is
+  // what 'remove' marks -- not just "take it off" but "we no longer vouch that
+  // it is on there".
+  it('re-offers a title whose removal was pending when it became eligible again', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null } }])
+    s.putPlexLink({ titleId: 'T1', ratingKey: 'k', state: 'remove', attempts: 0, nextTryAt: null })
+    expect(s.dueUnlinkedTitles('2026-09-16T13:00:00.000Z', 10)).toEqual(['T1'])
+    expect(s.dueRemovableTitles('2026-09-16T13:00:00.000Z', 10)).toEqual([])
+  })
+
+  it('still removes a title whose removal is pending and which stayed ineligible', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', deletedAt: '2026-09-16T12:00:00.000Z' } }])
+    s.putPlexLink({ titleId: 'T1', ratingKey: 'k', state: 'remove', attempts: 0, nextTryAt: null })
+    expect(s.dueRemovableTitles('2026-09-16T13:00:00.000Z', 10)).toMatchObject([{ titleId: 'T1', ratingKey: 'k' }])
+    expect(s.dueUnlinkedTitles('2026-09-16T13:00:00.000Z', 10)).toEqual([])
   })
 })
 
@@ -319,6 +338,133 @@ describe('dueUnlinkedTitles', () => {
       { pk: 'C', row: { titleId: 'C', kind: 'show', deletedAt: null } },
     ])
     expect(s.dueUnlinkedTitles(NOW, 2)).toHaveLength(2)
+  })
+
+  // A title parked in bingers does not belong on the plex watchlist, whatever
+  // its age -- these three are about intent, so unlike the date they apply
+  // even with no cutoff configured.
+  it.each(['watchlistHiddenAt', 'stoppedWatchingAt', 'forLaterAt'])('excludes a title parked via %s', field => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null, [field]: '2026-09-01T00:00:00.000Z' } }])
+    expect(s.dueUnlinkedTitles(NOW, 10)).toEqual([])
+  })
+
+  it('excludes a title followed before the cutoff and keeps one followed on it', () => {
+    s.putSyncRows('follows', [
+      { pk: 'OLD', row: { titleId: 'OLD', kind: 'show', deletedAt: null, followedAt: '2012-11-26T16:28:00.000Z' } },
+      { pk: 'NEW', row: { titleId: 'NEW', kind: 'show', deletedAt: null, followedAt: '2026-09-21T08:00:00.000Z' } },
+    ])
+    expect(s.dueUnlinkedTitles(NOW, 10, '2026-09-21')).toEqual(['NEW'])
+  })
+
+  // A date-only cutoff has to cover the whole day, not just midnight. String
+  // comparison gives that for free ONLY because the cutoff is the shorter
+  // prefix -- pinned here because switching to a full timestamp would break it
+  // silently, keeping just the titles followed in the first millisecond.
+  it('treats a date-only cutoff as covering the whole day', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null, followedAt: '2026-09-21T23:59:59.999Z' } }])
+    expect(s.dueUnlinkedTitles(NOW, 10, '2026-09-21')).toEqual(['T1'])
+  })
+
+  it('excludes a row with no followedAt once a cutoff is set, rather than guessing its age', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null } }])
+    expect(s.dueUnlinkedTitles(NOW, 10)).toEqual(['T1'])
+    expect(s.dueUnlinkedTitles(NOW, 10, '2026-09-21')).toEqual([])
+  })
+})
+
+describe('dueRemovableTitles', () => {
+  const NOW = '2026-09-16T12:00:00.000Z'
+  const link = (titleId: string) =>
+    s.putPlexLink({ titleId, ratingKey: `rk-${titleId}`, state: 'added', attempts: 0, nextTryAt: null })
+
+  it.each(['deletedAt', 'watchlistHiddenAt', 'stoppedWatchingAt', 'forLaterAt'])(
+    'returns a linked title parked via %s, with the ratingKey needed to undo it', field => {
+      s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null, [field]: '2026-09-16T00:00:00.000Z' } }])
+      link('T1')
+      expect(s.dueRemovableTitles(NOW, 10)).toMatchObject([{ titleId: 'T1', ratingKey: 'rk-T1' }])
+    })
+
+  it('returns a linked title followed before the cutoff', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null, followedAt: '2012-11-26T16:28:00.000Z' } }])
+    link('T1')
+    expect(s.dueRemovableTitles(NOW, 10, '2026-09-21')).toMatchObject([{ titleId: 'T1', ratingKey: 'rk-T1' }])
+  })
+
+  it('leaves a title that still belongs on the watchlist alone', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null, followedAt: '2026-09-21T08:00:00.000Z' } }])
+    link('T1')
+    expect(s.dueRemovableTitles(NOW, 10, '2026-09-21')).toEqual([])
+  })
+
+  // The two queries must be exact complements. If one title could appear in
+  // both, the add loop would put back what the remove loop just took off, once
+  // per cycle forever -- and every lap is a real pair of plex writes.
+  it('never returns a title that dueUnlinkedTitles would also return', () => {
+    s.putSyncRows('follows', [
+      { pk: 'KEEP', row: { titleId: 'KEEP', kind: 'show', deletedAt: null, followedAt: '2026-09-21T08:00:00.000Z' } },
+      { pk: 'DROP', row: { titleId: 'DROP', kind: 'show', deletedAt: null, followedAt: '2012-11-26T16:28:00.000Z' } },
+    ])
+    link('KEEP'); link('DROP')
+    const removable = s.dueRemovableTitles(NOW, 10, '2026-09-21').map(r => r.titleId)
+    const addable = s.dueUnlinkedTitles(NOW, 10, '2026-09-21')
+    expect(removable).toEqual(['DROP'])
+    expect(removable.filter(t => addable.includes(t))).toEqual([])
+  })
+
+  it('ignores links that were never added to the watchlist', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: '2026-09-16T00:00:00.000Z' } }])
+    s.putPlexLink({ titleId: 'T1', ratingKey: null, state: 'unresolved', attempts: 1, nextTryAt: null })
+    expect(s.dueRemovableTitles(NOW, 10)).toEqual([])
+  })
+
+  it('holds a title back until its removal backoff has elapsed', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: '2026-09-16T00:00:00.000Z' } }])
+    s.putPlexLink({ titleId: 'T1', ratingKey: 'rk-T1', state: 'added', attempts: 1, nextTryAt: '2026-09-16T13:00:00.000Z' })
+    expect(s.dueRemovableTitles(NOW, 10)).toEqual([])
+    expect(s.dueRemovableTitles('2026-09-16T14:00:00.000Z', 10)).toHaveLength(1)
+  })
+
+
+  // The preview log is the whole point of the opt-in: a list of titleIds and
+  // ratingKeys is unreviewable, so the row carries the name and the reason.
+  it('reports why each title is due for removal', () => {
+    const cases: [string, Record<string, unknown>, string][] = [
+      ['UNFOLLOWED', { deletedAt: '2026-09-16T00:00:00.000Z' }, 'unfollowed'],
+      ['HIDDEN', { watchlistHiddenAt: '2026-09-16T00:00:00.000Z' }, 'hidden'],
+      ['STOPPED', { stoppedWatchingAt: '2026-09-16T00:00:00.000Z' }, 'stopped'],
+      ['LATER', { forLaterAt: '2026-09-16T00:00:00.000Z' }, 'for later'],
+      ['OLD', { followedAt: '2012-11-26T16:28:00.000Z' }, 'followed before 2026-09-21'],
+    ]
+    for (const [id, row] of cases) {
+      s.putSyncRows('follows', [{ pk: id, row: { titleId: id, kind: 'show', deletedAt: null, ...row } }])
+      link(id)
+    }
+    const byId = new Map(s.dueRemovableTitles(NOW, 10, '2026-09-21').map(r => [r.titleId, r.reason]))
+    for (const [id, , reason] of cases) expect(byId.get(id)).toBe(reason)
+  })
+
+  it('carries the title name so the preview is readable without a lookup', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'movie', deletedAt: '2026-09-16T00:00:00.000Z' } }])
+    s.putTitleMapping([{ source: 'tmdb', extId: '9999', kind: 'movie', titleId: 'T1', title: 'Zack and Miri Make a Porno', year: 2008 }])
+    link('T1')
+    expect(s.dueRemovableTitles(NOW, 10)[0]).toMatchObject({ title: 'Zack and Miri Make a Porno', year: 2008 })
+  })
+
+  it('does not duplicate a title that has several external id mappings', () => {
+    s.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: '2026-09-16T00:00:00.000Z' } }])
+    s.putTitleMapping([
+      { source: 'tmdb', extId: '1', kind: 'show', titleId: 'T1', title: 'Tires', year: 2024 },
+      { source: 'tvdb', extId: '2', kind: 'show', titleId: 'T1', title: 'Tires', year: 2024 },
+    ])
+    link('T1')
+    expect(s.dueRemovableTitles(NOW, 10)).toHaveLength(1)
+  })
+  it('honours the limit', () => {
+    for (const t of ['A', 'B', 'C']) {
+      s.putSyncRows('follows', [{ pk: t, row: { titleId: t, kind: 'show', deletedAt: '2026-09-16T00:00:00.000Z' } }])
+      link(t)
+    }
+    expect(s.dueRemovableTitles(NOW, 2)).toHaveLength(2)
   })
 })
 

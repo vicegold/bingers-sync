@@ -408,14 +408,15 @@ describe('optimistic local mirror', () => {
 
   // The other half of the reverse-sync round trip: when the forward path
   // unfollows a title (pulsarr saw it leave the plex watchlist), the mirrored
-  // delete must also drop the plex_link, or re-following the title later leaves
-  // it permanently invisible to the reverse queue.
-  it('drops the plex_link when a confirmed unfollow is mirrored', async () => {
+  // delete must stop the link claiming the title is on plex -- while KEEPING
+  // the ratingKey, which is the only way to take it off again. Hence 'remove'
+  // rather than the outright delete this used to assert.
+  it('marks the plex_link for removal when a confirmed unfollow is mirrored', async () => {
     store.putPlexLink({ titleId: 'T1', ratingKey: 'k', state: 'added', attempts: 0, nextTryAt: null })
     const del = { opId: 'd1', table: 'follows' as const, pk: { titleId: 'T1' }, deleted: true as const }
     await submit(mk(ok()), createGate(), [del] as any)
     expect(store.getSyncRow('follows', 'T1')).toMatchObject({ titleId: 'T1' })
-    expect(store.getPlexLink('T1')).toBeNull()
+    expect(store.getPlexLink('T1')).toMatchObject({ state: 'remove', ratingKey: 'k' })
   })
 
   // Fix round 1: a rating-only entries op must never invent a watched flag.

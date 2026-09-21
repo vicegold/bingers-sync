@@ -321,8 +321,8 @@ async function main() {
   const reverse = async () => {
     try {
       const r = await reconcileWatchlist({ config, store })
-      if (r.added || r.unresolved || r.deferred) {
-        console.log(`[reverse] added ${r.added}, unresolved ${r.unresolved}, deferred ${r.deferred}`)
+      if (r.added || r.removed || r.unresolved || r.deferred) {
+        console.log(`[reverse] added ${r.added}, removed ${r.removed}, unresolved ${r.unresolved}, deferred ${r.deferred}`)
       }
     } catch (e) { console.error('[reverse]', (e as Error).message) }
   }

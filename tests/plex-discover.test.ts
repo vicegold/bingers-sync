@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { searchDiscover, discoverIds, addToWatchlist, ratingKeyFromGuid, DISCOVER_TIMEOUT_MS } from '../src/plex/discover.js'
+import { searchDiscover, discoverIds, addToWatchlist, removeFromWatchlist, ratingKeyFromGuid, DISCOVER_TIMEOUT_MS } from '../src/plex/discover.js'
 
 const deps = (f: any) => ({ plexToken: 'tok', fetchImpl: f as typeof fetch })
 const stub = (body: unknown, status = 200) =>
@@ -104,5 +104,25 @@ describe('addToWatchlist', () => {
 
   it('throws on a non-2xx so the caller can record it', async () => {
     await expect(addToWatchlist(deps(stub({}, 500)), 'k1')).rejects.toThrow(/500/)
+  })
+})
+
+describe('removeFromWatchlist', () => {
+  // Verified live against discover on 2026-09-21: PUT
+  // /actions/removeFromWatchlist?ratingKey=... -> 200 {"MediaContainer":{"size":0}},
+  // exactly mirroring the add.
+  it('PUTs the remove action with the ratingKey and the plex token', async () => {
+    const f = stub({ MediaContainer: { size: 0 } })
+    await removeFromWatchlist(deps(f), '5d77683454f42c001f8c438e')
+    const [url, init] = (f as any).mock.calls[0]
+    expect(url).toBe('https://discover.provider.plex.tv/actions/removeFromWatchlist?ratingKey=5d77683454f42c001f8c438e')
+    expect(init.method).toBe('PUT')
+    expect(init.headers['X-Plex-Token']).toBe('tok')
+    expect(init.signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('throws on a non-2xx so the caller can back off rather than drop the link', async () => {
+    const f = stub({}, 503)
+    await expect(removeFromWatchlist(deps(f), 'k')).rejects.toThrow(/503/)
   })
 })

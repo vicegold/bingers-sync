@@ -22,12 +22,43 @@ export type RatingLink = { entityKind: 'episode' | 'movie'; entityId: string; bi
  *              a bounded retry of its own, so a permanently-deferring title
  *              cannot sit in every batch forever and starve the queue.
  */
-export type PlexLinkState = 'added' | 'unresolved' | 'deferred'
+// 'remove' is a link we no longer vouch for: the title stopped belonging on
+// the plex watchlist, and the ratingKey is kept precisely so it can be taken
+// off again. It is NOT 'added' (we will not claim the title is on plex) and it
+// is not absent (we would lose the key), which is why it needs a name.
+export type PlexLinkState = 'added' | 'unresolved' | 'deferred' | 'remove'
 // plex_link's ratingKey comes from the DISCOVER/watchlist-add flow (see
 // reverse.ts) -- a different namespace from the `__plex_show:` cache below,
 // which comes from a locally-scanned/scrobbled server ratingKey. Two stores,
 // deliberately: neither substitutes for the other.
+/** A title due to come off the plex watchlist, with enough context to review
+ * the decision in a log line rather than by cross-referencing ids. */
+export type RemovableTitle = {
+  titleId: string; ratingKey: string; title: string | null; year: number | null; reason: string
+}
 export type PlexLink = { titleId: string; ratingKey: string | null; state: PlexLinkState; attempts: number; nextTryAt: string | null; checkedAt: string }
+
+/**
+ * Does this follows row belong on the plex watchlist?
+ *
+ * Parked states and an unfollow are statements of intent, so they apply
+ * always; the date applies only when a cutoff is configured (@cutoff NULL
+ * means "no cutoff", which is the default and preserves the original
+ * behaviour). COALESCE, not a bare comparison: a row with no followedAt would
+ * otherwise make the whole expression NULL, which reads as false here and ALSO
+ * as false under NOT, so such a row would be neither added nor removed.
+ *
+ * dueUnlinkedTitles and dueRemovableTitles are the two sides of this one
+ * predicate and must stay exact complements -- if a title could satisfy both,
+ * each cycle would re-add what the last one removed, forever, two plex writes
+ * at a time. There is a test pinning that.
+ */
+const ELIGIBLE = `
+  json_extract(s.row_json, '$.deletedAt')          IS NULL
+  AND json_extract(s.row_json, '$.watchlistHiddenAt') IS NULL
+  AND json_extract(s.row_json, '$.stoppedWatchingAt') IS NULL
+  AND json_extract(s.row_json, '$.forLaterAt')        IS NULL
+  AND (@cutoff IS NULL OR COALESCE(json_extract(s.row_json, '$.followedAt') >= @cutoff, 0))`
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS title_map (
@@ -168,23 +199,26 @@ export function openStore(dbPath: string) {
         .get(table, pk) as { row_json: string } | undefined
       return r ? JSON.parse(r.row_json) : null
     },
-    // Writing a follows row with `deletedAt` set also DROPS that title's
-    // plex_link. Without this, the round trip "reverse adds it -> you remove it
-    // from the watchlist -> pulsarr unfollows it on bingers -> you follow it
-    // again" leaves a stale state='added' link behind: the title is on neither
-    // the watchlist nor the reverse queue (dueUnlinkedTitles filters 'added'
-    // out) and /health still counts it as linked. Clearing the link here rather
-    // than at each call site means every writer of a deleted follows row --
-    // sync/pull and the outbox mirror today, anything added later -- gets it,
-    // in the same transaction as the row itself.
+    // A deleted follows row deliberately does NOT drop that title's plex_link
+    // any more. It used to, so that a re-followed title could not hide behind a
+    // stale state='added' link -- but the ratingKey in that link is the only
+    // way to take the title back OFF the plex watchlist, and an unfollow is
+    // precisely when that has to happen. Dropping it here meant the watchlist
+    // kept every title you ever unfollowed, unrecoverably.
+    //
+    // reconcileWatchlist owns that cleanup now: an unfollowed row is not
+    // eligible, so dueRemovableTitles returns it, and the link is dropped once
+    // plex confirms the removal -- after which a re-follow finds no link and is
+    // added again as before.
     putSyncRows(table: string, rows: { pk: string; row: unknown }[]) {
       const st = db.prepare(`INSERT INTO sync_state (table_name, pk, row_json, updated_at) VALUES (?,?,?,?)
         ON CONFLICT(table_name, pk) DO UPDATE SET row_json=excluded.row_json, updated_at=excluded.updated_at`)
-      const unlink = db.prepare('DELETE FROM plex_link WHERE title_id=?')
+      const markForRemoval = db.prepare(
+        `UPDATE plex_link SET state='remove', attempts=0, next_try_at=NULL WHERE title_id=? AND state='added'`)
       db.transaction(() => {
         for (const r of rows) {
           st.run(table, r.pk, JSON.stringify(r.row), now())
-          if (table === 'follows' && (r.row as { deletedAt?: unknown } | null)?.deletedAt != null) unlink.run(r.pk)
+          if (table === 'follows' && (r.row as { deletedAt?: unknown } | null)?.deletedAt != null) markForRemoval.run(r.pk)
         }
       })()
     },
@@ -352,15 +386,50 @@ export function openStore(dbPath: string) {
           attempts=excluded.attempts, next_try_at=excluded.next_try_at, checked_at=excluded.checked_at`)
         .run(l.titleId, l.ratingKey, l.state, l.attempts, l.nextTryAt, now())
     },
-    dueUnlinkedTitles(nowIso: string, limit: number): string[] {
+    dueUnlinkedTitles(nowIso: string, limit: number, cutoff: string | null = null): string[] {
       const rows = db.prepare(`
         SELECT s.pk AS title_id FROM sync_state s
         LEFT JOIN plex_link p ON p.title_id = s.pk
         WHERE s.table_name = 'follows'
-          AND json_extract(s.row_json, '$.deletedAt') IS NULL
-          AND (p.title_id IS NULL OR (p.state IN ('unresolved','deferred') AND (p.next_try_at IS NULL OR p.next_try_at <= ?)))
-        ORDER BY s.updated_at LIMIT ?`).all(nowIso, limit) as { title_id: string }[]
+          AND (${ELIGIBLE})
+          AND (p.title_id IS NULL OR (p.state IN ('unresolved','deferred','remove') AND (p.next_try_at IS NULL OR p.next_try_at <= @now)))
+        ORDER BY s.updated_at LIMIT @limit`).all({ now: nowIso, limit, cutoff }) as { title_id: string }[]
       return rows.map(r => r.title_id)
+    },
+    /**
+     * The other side of ELIGIBLE: titles WE put on the plex watchlist that no
+     * longer belong there, with the ratingKey needed to take them off again.
+     *
+     * Only state='added' rows qualify, which is what keeps this honest -- it is
+     * the record that this service added the title, so a title you watchlisted
+     * yourself in plex is never touched. A link with no follows row at all is
+     * left alone too (INNER JOIN): we cannot judge what we cannot read.
+     */
+    deletePlexLink(titleId: string) {
+      db.prepare('DELETE FROM plex_link WHERE title_id=?').run(titleId)
+    },
+    dueRemovableTitles(nowIso: string, limit: number, cutoff: string | null = null): RemovableTitle[] {
+      return db.prepare(`
+        SELECT p.title_id AS titleId, p.rating_key AS ratingKey,
+          -- Name and year for the preview log. A correlated subquery, not a
+          -- join: title_map holds one row per external id, and joining would
+          -- return the same title once per source it is mapped from.
+          (SELECT title FROM title_map WHERE title_id = p.title_id LIMIT 1) AS title,
+          (SELECT year  FROM title_map WHERE title_id = p.title_id LIMIT 1) AS year,
+          CASE
+            WHEN json_extract(s.row_json, '$.deletedAt')         IS NOT NULL THEN 'unfollowed'
+            WHEN json_extract(s.row_json, '$.watchlistHiddenAt') IS NOT NULL THEN 'hidden'
+            WHEN json_extract(s.row_json, '$.stoppedWatchingAt') IS NOT NULL THEN 'stopped'
+            WHEN json_extract(s.row_json, '$.forLaterAt')        IS NOT NULL THEN 'for later'
+            ELSE 'followed before ' || @cutoff
+          END AS reason
+        FROM plex_link p
+        JOIN sync_state s ON s.table_name = 'follows' AND s.pk = p.title_id
+        WHERE p.state IN ('added','remove') AND p.rating_key IS NOT NULL
+          AND (p.next_try_at IS NULL OR p.next_try_at <= @now)
+          AND NOT (${ELIGIBLE})
+        ORDER BY p.checked_at LIMIT @limit`)
+        .all({ now: nowIso, limit, cutoff }) as RemovableTitle[]
     },
     externalIdsFor(titleId: string) {
       const rows = db.prepare('SELECT source, ext_id, title, year FROM title_map WHERE title_id=?')

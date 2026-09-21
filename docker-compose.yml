@@ -22,6 +22,8 @@ services:
             # - BINGERS_USER_AGENT= # ua sent to bingers, defaults to the real app's
             # - REVERSE_SYNC=false # opt-in: add bingers follows to the plex watchlist, only "true" enables it
             # - REVERSE_BATCH=10 # titles reconciled per pull, keeps the first run calm
+            # - REVERSE_FOLLOWED_SINCE= # ISO date; only follows added on/after it go to plex, older ones are listed for removal
+            # - REVERSE_REMOVE=false # actually take the listed titles off the watchlist, only "true" enables it
             # - RATING_SYNC=false # sync ratings both ways, off by default
         volumes:
             - ./data:/data

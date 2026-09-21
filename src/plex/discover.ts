@@ -75,3 +75,10 @@ export async function discoverIds(deps: DiscoverDeps, ratingKey: string): Promis
 export async function addToWatchlist(deps: DiscoverDeps, ratingKey: string): Promise<void> {
   await call(deps, `${D}/actions/addToWatchlist?ratingKey=${encodeURIComponent(ratingKey)}`, { method: 'PUT' })
 }
+
+// The exact mirror of the add, verified live against discover: 200 with
+// {"MediaContainer":{"size":0}}. Non-2xx throws, so the caller backs off and
+// keeps the link rather than forgetting a title still sitting on the watchlist.
+export async function removeFromWatchlist(deps: DiscoverDeps, ratingKey: string): Promise<void> {
+  await call(deps, `${D}/actions/removeFromWatchlist?ratingKey=${encodeURIComponent(ratingKey)}`, { method: 'PUT' })
+}

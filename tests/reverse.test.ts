@@ -220,7 +220,9 @@ describe('reconcileWatchlist', () => {
     expect((await reconcileWatchlist({ config: cfg(), store, fetchImpl: f as any })).added).toBe(1)
 
     store.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: '2026-09-16T12:00:00.000Z' } }])
-    expect(store.getPlexLink('T1')).toBeNull()
+    // The link survives the unfollow so the sweep can take the title off plex,
+    // but as 'remove': it no longer asserts the title is on the watchlist.
+    expect(store.getPlexLink('T1')).toMatchObject({ state: 'remove', ratingKey: 'RIGHT' })
     expect(store.dueUnlinkedTitles(new Date().toISOString(), 10)).toEqual([]) // unfollowed: not a candidate
 
     store.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null } }])
@@ -333,7 +335,7 @@ describe('reconcileWatchlist', () => {
     f.mockClear()
     const r3 = await reconcileWatchlist({ config: cfg(), store, fetchImpl: f as any })
     expect(f).not.toHaveBeenCalled()
-    expect(r3).toEqual({ added: 0, unresolved: 0, skipped: 0, deferred: 0 })
+    expect(r3).toEqual({ added: 0, removed: 0, unresolved: 0, skipped: 0, deferred: 0 })
   })
 
   it('respects a per-run budget so a first run cannot storm discover', async () => {
@@ -350,7 +352,126 @@ describe('reconcileWatchlist', () => {
     follow('T1')
     const { f } = router([SEARCH_HIT, IDS_MATCH, ADD_OK])
     const r = await reconcileWatchlist({ config: cfg({ REVERSE_SYNC: 'false' }), store, fetchImpl: f as any })
-    expect(r).toEqual({ added: 0, unresolved: 0, skipped: 0, deferred: 0 })
+    expect(r).toEqual({ added: 0, removed: 0, unresolved: 0, skipped: 0, deferred: 0 })
     expect(f).not.toHaveBeenCalled()
+  })
+})
+
+describe('reconcileWatchlist removal sweep', () => {
+  const REMOVE_OK: [RegExp, unknown] = [/removeFromWatchlist/, { MediaContainer: { size: 0 } }]
+  // Removal is opt-in on its own: the cutoff alone only ever previews.
+  const REMOVE = { REVERSE_REMOVE: 'true' }
+  // A title we added that bingers no longer wants on the watchlist.
+  const linkedButParked = (titleId: string, row: Record<string, unknown>) => {
+    store.putSyncRows('follows', [{ pk: titleId, row: { titleId, kind: 'show', deletedAt: null, ...row } }])
+    store.putPlexLink({ titleId, ratingKey: `rk-${titleId}`, state: 'added', attempts: 0, nextTryAt: null })
+  }
+
+  it('takes a parked title off the watchlist and forgets the link', async () => {
+    linkedButParked('T1', { watchlistHiddenAt: '2026-09-20T10:00:00.000Z' })
+    const { f, calls } = router([REMOVE_OK])
+    const r = await reconcileWatchlist({ config: cfg(REMOVE), store, fetchImpl: f as any })
+    expect(r.removed).toBe(1)
+    expect(calls.some(c => /removeFromWatchlist\?ratingKey=rk-T1/.test(c.url))).toBe(true)
+    expect(store.getPlexLink('T1')).toBeNull() // forgotten only after plex confirmed
+  })
+
+  it('takes off a title followed before the cutoff, and leaves a newer one alone', async () => {
+    linkedButParked('OLD', { followedAt: '2012-11-26T16:28:00.000Z' })
+    linkedButParked('NEW', { followedAt: '2026-09-21T09:00:00.000Z' })
+    const { f, calls } = router([REMOVE_OK])
+    const r = await reconcileWatchlist({ config: cfg({ ...REMOVE, REVERSE_FOLLOWED_SINCE: '2026-09-21' }), store, fetchImpl: f as any })
+    expect(r.removed).toBe(1)
+    expect(calls.filter(c => /removeFromWatchlist/.test(c.url)).map(c => c.url.match(/ratingKey=(\S+)/)![1])).toEqual(['rk-OLD'])
+    expect(store.getPlexLink('NEW')).toMatchObject({ state: 'added' })
+  })
+
+  it('never adds a title it would also remove', async () => {
+    // extId pinned to the one IDS_MATCH answers for: with the sequence follow()
+    // hands out, the discover match would miss and this would pass whether or
+    // not the cutoff filtered anything.
+    follow('T1', '5920')
+    store.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null, followedAt: '2012-11-26T16:28:00.000Z' } }])
+    const { f, calls } = router([SEARCH_HIT, IDS_MATCH, ADD_OK, REMOVE_OK])
+    const r = await reconcileWatchlist({ config: cfg({ REVERSE_FOLLOWED_SINCE: '2026-09-21' }), store, fetchImpl: f as any })
+    expect(r.added).toBe(0)
+    expect(calls.some(c => /addToWatchlist/.test(c.url))).toBe(false)
+  })
+
+  it('writes nothing to plex under DRY_RUN', async () => {
+    linkedButParked('T1', { stoppedWatchingAt: '2026-09-20T10:00:00.000Z' })
+    const { f, calls } = router([REMOVE_OK])
+    const r = await reconcileWatchlist({ config: cfg({ ...REMOVE, DRY_RUN: 'true' }), store, fetchImpl: f as any })
+    expect(r.removed).toBe(0)
+    expect(calls.some(c => /removeFromWatchlist/.test(c.url))).toBe(false)
+    expect(store.getPlexLink('T1')).toMatchObject({ state: 'added' }) // left exactly as eligible as it was found
+  })
+
+  // Keeping the link is the whole point: forget it and the title stays on the
+  // watchlist with nothing left that knows how to take it off.
+  it('keeps the link and backs off when plex refuses the removal', async () => {
+    linkedButParked('T1', { forLaterAt: '2026-09-20T10:00:00.000Z' })
+    const { f } = router([[/removeFromWatchlist/, {}, 503]])
+    const r = await reconcileWatchlist({ config: cfg(REMOVE), store, fetchImpl: f as any })
+    expect(r.removed).toBe(0)
+    const link = store.getPlexLink('T1')
+    expect(link).toMatchObject({ ratingKey: 'rk-T1' })
+    expect(link!.attempts).toBe(1)
+    expect(Date.parse(link!.nextTryAt!)).toBeGreaterThan(Date.now())
+    expect(store.listFailures().some(x => /removeFromWatchlist/.test(x.reason))).toBe(true)
+  })
+
+  it('honours REVERSE_BATCH so a backlog drains in bounded steps', async () => {
+    for (const t of ['A', 'B', 'C']) linkedButParked(t, { watchlistHiddenAt: '2026-09-20T10:00:00.000Z' })
+    const { f, calls } = router([REMOVE_OK])
+    const r = await reconcileWatchlist({ config: cfg({ ...REMOVE, REVERSE_BATCH: '2' }), store, fetchImpl: f as any })
+    expect(r.removed).toBe(2)
+    expect(calls.filter(c => /removeFromWatchlist/.test(c.url))).toHaveLength(2)
+  })
+})
+
+describe('removal preview', () => {
+  const linked = (titleId: string, title: string, row: Record<string, unknown>) => {
+    store.putSyncRows('follows', [{ pk: titleId, row: { titleId, kind: 'show', deletedAt: null, ...row } }])
+    store.putTitleMapping([{ source: 'tmdb', extId: `x${titleId}`, kind: 'show', titleId, title, year: 2008 }])
+    store.putPlexLink({ titleId, ratingKey: `rk-${titleId}`, state: 'added', attempts: 0, nextTryAt: null })
+  }
+
+  it('lists what it would remove, and touches nothing, until REVERSE_REMOVE says otherwise', async () => {
+    linked('T1', 'Zack and Miri Make a Porno', { followedAt: '2012-11-26T16:28:00.000Z' })
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const { f, calls } = router([[/removeFromWatchlist/, { MediaContainer: { size: 0 } }]])
+    try {
+      const r = await reconcileWatchlist({ config: cfg({ REVERSE_FOLLOWED_SINCE: '2026-09-21' }), store, fetchImpl: f as any })
+      expect(r.removed).toBe(0)
+      expect(calls.some(c => /removeFromWatchlist/.test(c.url))).toBe(false)
+      expect(store.getPlexLink('T1')).toMatchObject({ state: 'added' })
+      const line = log.mock.calls.map(c => c.join(' ')).find(l => /would remove/.test(l))
+      expect(line).toMatch(/Zack and Miri Make a Porno/)
+      expect(line).toMatch(/followed before 2026-09-21/) // why, not just what
+    } finally { log.mockRestore() }
+  })
+
+  // The sweep is batched so a live run drains in bounded steps, but a preview
+  // that showed 10 of 246 would be useless for deciding whether to run it.
+  it('previews the whole backlog, not one REVERSE_BATCH of it', async () => {
+    for (const t of ['A', 'B', 'C']) linked(t, `Title ${t}`, { watchlistHiddenAt: '2026-09-20T10:00:00.000Z' })
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const { f } = router([])
+    try {
+      await reconcileWatchlist({ config: cfg({ REVERSE_BATCH: '2' }), store, fetchImpl: f as any })
+      expect(log.mock.calls.map(c => c.join(' ')).filter(l => /would remove/.test(l))).toHaveLength(3)
+    } finally { log.mockRestore() }
+  })
+
+  it('needs REVERSE_REMOVE to be exactly "true" before it touches plex', async () => {
+    linked('T1', 'Tires', { watchlistHiddenAt: '2026-09-20T10:00:00.000Z' })
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const { f, calls } = router([[/removeFromWatchlist/, { MediaContainer: { size: 0 } }]])
+    try {
+      const r = await reconcileWatchlist({ config: cfg({ REVERSE_REMOVE: 'yes' }), store, fetchImpl: f as any })
+      expect(r.removed).toBe(0)
+      expect(calls.some(c => /removeFromWatchlist/.test(c.url))).toBe(false)
+    } finally { log.mockRestore() }
   })
 })
