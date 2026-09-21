@@ -26,7 +26,10 @@ export type RatingLink = { entityKind: 'episode' | 'movie'; entityId: string; bi
 // the plex watchlist, and the ratingKey is kept precisely so it can be taken
 // off again. It is NOT 'added' (we will not claim the title is on plex) and it
 // is not absent (we would lose the key), which is why it needs a name.
-export type PlexLinkState = 'added' | 'unresolved' | 'deferred' | 'remove'
+// 'preexisting' is the title being on your watchlist WITHOUT us having put it
+// there. It is linked (so we do not add it again) but is never removable: it
+// was never ours to take away.
+export type PlexLinkState = 'added' | 'unresolved' | 'deferred' | 'remove' | 'preexisting'
 // plex_link's ratingKey comes from the DISCOVER/watchlist-add flow (see
 // reverse.ts) -- a different namespace from the `__plex_show:` cache below,
 // which comes from a locally-scanned/scrobbled server ratingKey. Two stores,

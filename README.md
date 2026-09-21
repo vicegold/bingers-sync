@@ -115,6 +115,14 @@ Verify the log looks right, then set `DRY_RUN=false` and restart.
   are never touched: only a title carrying a `plex_link` this service wrote is
   ever removed. Un-hide something and it goes back, because the add and remove
   rules are the same rule read in two directions.
+- Only titles **this service actually added** are ever removed, and that is
+  established before adding, not assumed afterwards: each run reads your Plex
+  watchlist once and records a title already on it as `preexisting` — linked, so
+  it is not reconsidered, but never removable. This matters because
+  `addToWatchlist` answers 200 whether or not the title was already there, so a
+  successful call says nothing about who put it on the list. On the first real
+  deployment 187 of 254 links were titles watchlisted by hand years earlier. If
+  the watchlist cannot be read, the run adds nothing rather than adding blind.
 - Removing is opt-in separately from the cutoff: until `REVERSE_REMOVE=true`
   (that exact string), every reconcile logs the complete list it *would* take
   off — name, year and the reason (`hidden`, `stopped`, `for later`,
