@@ -28,9 +28,15 @@ function follow(titleId: string, extId = `592${extSeq++}`) {
 // request that matches a broader route.
 function router(routes: [RegExp, unknown, number?][]) {
   const calls: { url: string; init?: any }[] = []
+  // Every reconcile with something to add first reads the watchlist, to tell
+  // "we put this here" from "it was already there". Default it to empty so
+  // tests about adding stay about adding; routes are matched in order, so a
+  // test that cares supplies its own entry ahead of this one.
+  const all: [RegExp, unknown, number?][] = [...routes,
+    [/sections\/watchlist\/all/, { MediaContainer: { totalSize: 0, Metadata: [] } }]]
   const f = vi.fn(async (url: string, init?: any) => {
     calls.push({ url, init })
-    for (const [re, body, status] of routes) if (re.test(url)) return new Response(JSON.stringify(body), { status: status ?? 200 })
+    for (const [re, body, status] of all) if (re.test(url)) return new Response(JSON.stringify(body), { status: status ?? 200 })
     return new Response('{}', { status: 404 })
   })
   return { f, calls }
@@ -335,7 +341,7 @@ describe('reconcileWatchlist', () => {
     f.mockClear()
     const r3 = await reconcileWatchlist({ config: cfg(), store, fetchImpl: f as any })
     expect(f).not.toHaveBeenCalled()
-    expect(r3).toEqual({ added: 0, removed: 0, unresolved: 0, skipped: 0, deferred: 0 })
+    expect(r3).toEqual({ added: 0, removed: 0, preexisting: 0, unresolved: 0, skipped: 0, deferred: 0 })
   })
 
   it('respects a per-run budget so a first run cannot storm discover', async () => {
@@ -352,7 +358,7 @@ describe('reconcileWatchlist', () => {
     follow('T1')
     const { f } = router([SEARCH_HIT, IDS_MATCH, ADD_OK])
     const r = await reconcileWatchlist({ config: cfg({ REVERSE_SYNC: 'false' }), store, fetchImpl: f as any })
-    expect(r).toEqual({ added: 0, removed: 0, unresolved: 0, skipped: 0, deferred: 0 })
+    expect(r).toEqual({ added: 0, removed: 0, preexisting: 0, unresolved: 0, skipped: 0, deferred: 0 })
     expect(f).not.toHaveBeenCalled()
   })
 })
@@ -473,5 +479,53 @@ describe('removal preview', () => {
       expect(r.removed).toBe(0)
       expect(calls.some(c => /removeFromWatchlist/.test(c.url))).toBe(false)
     } finally { log.mockRestore() }
+  })
+})
+
+describe('watchlist provenance', () => {
+  // The defect this exists to prevent: addToWatchlist answers 200 whether or
+  // not the title was already there, so a successful call proved nothing about
+  // who put it on the list. 187 of 254 links turned out to be titles the user
+  // had watchlisted themselves, and the sweep would have taken them off.
+  const ON_WATCHLIST: [RegExp, unknown] = [/sections\/watchlist\/all/,
+    { MediaContainer: { totalSize: 1, Metadata: [{ ratingKey: 'RIGHT' }] } }]
+
+  it('records a title already on your watchlist as preexisting, and does not add it', async () => {
+    follow('T1', '5920')
+    const { f, calls } = router([ON_WATCHLIST, SEARCH_HIT, IDS_MATCH, ADD_OK])
+    const r = await reconcileWatchlist({ config: cfg(), store, fetchImpl: f as any })
+    expect(r.added).toBe(0)
+    expect(r.preexisting).toBe(1)
+    expect(calls.some(c => /addToWatchlist/.test(c.url))).toBe(false)
+    expect(store.getPlexLink('T1')).toMatchObject({ state: 'preexisting', ratingKey: 'RIGHT' })
+  })
+
+  it('never offers a preexisting title for removal, however old the follow', async () => {
+    store.putSyncRows('follows', [{ pk: 'T1', row: { titleId: 'T1', kind: 'show', deletedAt: null, followedAt: '2012-11-26T16:28:00.000Z' } }])
+    store.putPlexLink({ titleId: 'T1', ratingKey: 'RIGHT', state: 'preexisting', attempts: 0, nextTryAt: null })
+    const { f, calls } = router([[/removeFromWatchlist/, { MediaContainer: { size: 0 } }]])
+    const r = await reconcileWatchlist({
+      config: cfg({ REVERSE_REMOVE: 'true', REVERSE_FOLLOWED_SINCE: '2026-09-21' }), store, fetchImpl: f as any })
+    expect(r.removed).toBe(0)
+    expect(calls.some(c => /removeFromWatchlist/.test(c.url))).toBe(false)
+    expect(store.getPlexLink('T1')).toMatchObject({ state: 'preexisting' })
+  })
+
+  // Adding blind is what caused the damage, so an unreadable watchlist must
+  // stop the add loop rather than fall back to the old behaviour.
+  it('defers instead of adding blind when the watchlist cannot be read', async () => {
+    follow('T1', '5920')
+    const { f, calls } = router([[/sections\/watchlist\/all/, {}, 500], SEARCH_HIT, IDS_MATCH, ADD_OK])
+    const r = await reconcileWatchlist({ config: cfg(), store, fetchImpl: f as any })
+    expect(r.added).toBe(0)
+    expect(r.deferred).toBe(1)
+    expect(calls.some(c => /addToWatchlist/.test(c.url))).toBe(false)
+  })
+
+  it('reads the watchlist once per run, not once per title', async () => {
+    for (const t of ['T1', 'T2', 'T3']) follow(t)
+    const { f, calls } = router([SEARCH_HIT, IDS_MATCH, ADD_OK])
+    await reconcileWatchlist({ config: cfg(), store, fetchImpl: f as any })
+    expect(calls.filter(c => /sections\/watchlist\/all/.test(c.url))).toHaveLength(1)
   })
 })

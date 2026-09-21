@@ -72,6 +72,37 @@ export async function discoverIds(deps: DiscoverDeps, ratingKey: string): Promis
   return out
 }
 
+/**
+ * The ratingKeys already on the plex watchlist.
+ *
+ * This is what makes an add honest. addToWatchlist is idempotent -- it answers
+ * 200 whether or not the title was already there -- so a successful call proves
+ * nothing about who put it on the list. Without this check the service recorded
+ * every such call as its own doing and would later "take back" titles the user
+ * had watchlisted years earlier.
+ *
+ * Paginated deliberately: the listing defaults to 20 per page and a real
+ * watchlist runs to hundreds, so a single page would report most of it as
+ * absent -- the wrong answer, in the dangerous direction.
+ */
+export async function fetchWatchlistKeys(deps: DiscoverDeps): Promise<Set<string>> {
+  const keys = new Set<string>()
+  for (let start = 0; start < WATCHLIST_MAX; start += WATCHLIST_PAGE) {
+    const res = await call(deps, `${D}/library/sections/watchlist/all`
+      + `?X-Plex-Container-Start=${start}&X-Plex-Container-Size=${WATCHLIST_PAGE}`)
+    const b = (await res.json()) as { MediaContainer?: { totalSize?: number; Metadata?: { ratingKey?: unknown }[] } }
+    const page = b.MediaContainer?.Metadata ?? []
+    for (const m of page) if (m.ratingKey != null) keys.add(String(m.ratingKey))
+    // An empty page ends it even if totalSize disagrees: trusting the count
+    // alone would spin here forever against a server that keeps saying 0.
+    if (page.length === 0 || keys.size >= (b.MediaContainer?.totalSize ?? 0)) break
+  }
+  return keys
+}
+
+const WATCHLIST_PAGE = 100
+const WATCHLIST_MAX = 10_000
+
 export async function addToWatchlist(deps: DiscoverDeps, ratingKey: string): Promise<void> {
   await call(deps, `${D}/actions/addToWatchlist?ratingKey=${encodeURIComponent(ratingKey)}`, { method: 'PUT' })
 }
