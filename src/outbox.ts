@@ -119,7 +119,15 @@ function mirrorApplied(deps: SyncDeps, applied: Op[]): void {
     } else if ('deleted' in o) {
       follows.push({ pk: o.pk.titleId, row: { titleId: o.pk.titleId, deletedAt: new Date().toISOString() } })
     } else {
-      follows.push({ pk: o.pk.titleId, row: { titleId: o.pk.titleId, kind: o.fields.kind, deletedAt: null } })
+      // Mirrored in PULL vocabulary, not push vocabulary: the reader
+      // (followState) sees rows that came from sync/pull, where a parked state
+      // is a nullable timestamp rather than a boolean. The op asserted both
+      // flags false, so both timestamps are null -- which is what stops a binge
+      // re-sending the same revive op on every episode.
+      follows.push({
+        pk: o.pk.titleId,
+        row: { titleId: o.pk.titleId, kind: o.fields.kind, forLaterAt: null, stoppedWatchingAt: null, deletedAt: null },
+      })
     }
   }
   const entries = [...entryRows.entries()].map(([pk, row]) => ({ pk, row }))

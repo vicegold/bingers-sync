@@ -406,6 +406,28 @@ describe('optimistic local mirror', () => {
     expect(store.getSyncRow('entries', 'episode:E1')).toBeNull()
   })
 
+  // A confirmed revive has to be mirrored in the vocabulary the READER uses.
+  // followState() reads forLaterAt/stoppedWatchingAt, because that is what
+  // sync/pull sends; mirroring the push-side booleans instead would leave the
+  // reader seeing undefined, and every episode of a binge would re-send the
+  // same revive op.
+  it('mirrors a confirmed revive as the null timestamps a pull would report', async () => {
+    store.putSyncRows('follows', [{
+      pk: 'T1',
+      row: { titleId: 'T1', kind: 'show', forLaterAt: '2026-09-20T22:06:15.138Z', deletedAt: null },
+    }])
+    const revive = {
+      opId: 'f1', table: 'follows' as const, pk: { titleId: 'T1' },
+      fields: { kind: 'show', forLater: false, stopped: false },
+    }
+    await submit(mk(ok()), createGate(), [revive] as any)
+
+    const row = store.getSyncRow('follows', 'T1') as any
+    expect(row.forLaterAt).toBeNull()
+    expect(row.stoppedWatchingAt).toBeNull()
+    expect(row.deletedAt).toBeNull()
+  })
+
   // The other half of the reverse-sync round trip: when the forward path
   // unfollows a title (pulsarr saw it leave the plex watchlist), the mirrored
   // delete must also drop the plex_link, or re-following the title later leaves

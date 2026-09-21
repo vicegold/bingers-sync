@@ -67,6 +67,18 @@ Verify the log looks right, then set `DRY_RUN=false` and restart.
 
 - `GET /setup` — connect to Bingers, as in step 4. Only reachable while there is
   no working session; `setupRequired` in `/health` says whether it is open.
+- A scrobble settles the show's state, not just the episode. A show parked in
+  **Watch Later**, or marked **stopped**, is moved back to actively tracked in
+  the same push, ahead of the episode itself — watching it means it is neither
+  any more. Hiding a show from your watchlist is left alone: that is a separate
+  choice, and Bingers merges the fields a write sends, so the ones it omits keep
+  their values.
+- A watch of an episode Bingers already counts as watched is recorded as a
+  **rewatch**: the play count only ever goes up, never below what Bingers already
+  has. Plex's own count is used when it is higher, but it is not trusted on its
+  own — it reports `1` for a rebuilt library and often omits the count entirely,
+  which would otherwise overwrite a real rewatch history with a single play.
+  Bingers keeps the first watch date and moves the last itself.
 - `GET /health` — dry-run state, days left on the session, whether writes are
   halted, outbox depth, and mirror freshness (`backfillEnabled` is false when the
   local mirror is stale, which suppresses backfill but not the scrobble itself).

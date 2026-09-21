@@ -138,6 +138,94 @@ describe('handlePlex', () => {
     expect(ops.some((o: any) => o.table === 'follows' && o.pk.titleId === '019f6bb9-65cf-78d1-b123-f9ed891fe9d7')).toBe(true)
   })
 
+  // The test that pins the push/pull asymmetry. A pulled follows row reports a
+  // parked show as the TIMESTAMP forLaterAt, never as the boolean forLater that
+  // a push asserts. Reading the push name off a pulled row yields undefined for
+  // every show on earth, so the revive would compile, ship, and silently never
+  // fire. Captured from the real app: forLater:true comes back as
+  // forLaterAt:"2026-09-20T22:06:15.138Z".
+  it('revives a show parked in Watch Later, reading the timestamp Bingers sends', async () => {
+    store.putSyncRows('follows', [{
+      pk: '019f6bb9-65cf-78d1-b123-f9ed891fe9d7',
+      row: {
+        titleId: '019f6bb9-65cf-78d1-b123-f9ed891fe9d7', kind: 'show',
+        forLaterAt: '2026-09-20T22:06:15.138Z', stoppedWatchingAt: null,
+        watchlistHiddenAt: null, deletedAt: null,
+      },
+    }])
+    const { f, calls } = router(ROUTES)
+    expect((await handlePlex(deps(f), SCROBBLE)).status).toBe('ok')
+
+    const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
+    const follow = ops.find((o: any) => o.table === 'follows')
+    expect(follow).toBeDefined()
+    expect(follow.fields).toEqual({ kind: 'show', forLater: false, stopped: false })
+    // and it lands BEFORE the episode, so the show is not parked at the moment
+    // the watch is recorded
+    expect(ops.indexOf(follow)).toBeLessThan(ops.findIndex((o: any) => o.table === 'entries'))
+  })
+
+  it('revives a show marked stopped, same timestamp reading', async () => {
+    store.putSyncRows('follows', [{
+      pk: '019f6bb9-65cf-78d1-b123-f9ed891fe9d7',
+      row: {
+        titleId: '019f6bb9-65cf-78d1-b123-f9ed891fe9d7', kind: 'show',
+        forLaterAt: null, stoppedWatchingAt: '2026-09-20T22:09:26.760Z', deletedAt: null,
+      },
+    }])
+    const { f, calls } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE)
+    const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
+    expect(ops.some((o: any) => o.table === 'follows')).toBe(true)
+  })
+
+  // The steady state: an ordinary followed show must not get a follow write on
+  // every single episode of a binge.
+  it('sends no follow op for a show that is followed and not parked', async () => {
+    store.putSyncRows('follows', [{
+      pk: '019f6bb9-65cf-78d1-b123-f9ed891fe9d7',
+      row: {
+        titleId: '019f6bb9-65cf-78d1-b123-f9ed891fe9d7', kind: 'show',
+        forLaterAt: null, stoppedWatchingAt: null, deletedAt: null,
+      },
+    }])
+    const { f, calls } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE)
+    const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
+    expect(ops.some((o: any) => o.table === 'follows')).toBe(false)
+  })
+
+  // Rewatches, end to end. SCROBBLE is S1E3 (…f117) and carries viewCount 1 --
+  // so without the stored count this writes plays:1 and wipes the rewatch
+  // history Bingers had. The row shape is the one sync/pull really sends.
+  it('writes a rewatch when bingers already counts this episode as watched', async () => {
+    store.putSyncRows('entries', [{
+      pk: 'episode:019f6bb9-65fd-7ef3-8053-8e3333a9f117',
+      row: {
+        entityKind: 'episode', entityId: '019f6bb9-65fd-7ef3-8053-8e3333a9f117',
+        watched: true, plays: 2, firstWatchedAt: '2026-05-12T18:47:00.000Z',
+        lastWatchedAt: '2026-08-01T10:00:00.000Z', deletedAt: null,
+      },
+    }])
+    const { f, calls } = router(ROUTES)
+    expect((await handlePlex(deps(f), SCROBBLE)).status).toBe('ok')
+
+    const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
+    const op = ops.find((o: any) =>
+      o.table === 'entries' && o.pk.entityId === '019f6bb9-65fd-7ef3-8053-8e3333a9f117')
+    expect(op.fields).toMatchObject({ watched: true, plays: 3 })
+  })
+
+  // The first watch of an episode bingers has never seen must be unaffected.
+  it('still writes plays 1 for a first watch', async () => {
+    const { f, calls } = router(ROUTES)
+    await handlePlex(deps(f), SCROBBLE)
+    const ops = JSON.parse(calls.find(c => /sync\/push/.test(c.url))!.init.body).ops
+    const op = ops.find((o: any) =>
+      o.table === 'entries' && o.pk.entityId === '019f6bb9-65fd-7ef3-8053-8e3333a9f117')
+    expect(op.fields.plays).toBe(1)
+  })
+
   it('records a failure and returns 200-shaped ok when nothing verifies', async () => {
     const { f } = router([
       [/library\/metadata\/90363\?includeGuids/, { MediaContainer: { Metadata: [{ Guid: [{ id: 'tmdb://000' }] }] } }],
