@@ -1,7 +1,7 @@
 import type { Config } from './config.js'
 import type { Store } from './store.js'
 import { titleExternalIds } from './resolve.js'
-import { searchDiscover, discoverIds, addToWatchlist, type DiscoverCandidate } from './plex/discover.js'
+import { searchDiscover, discoverIds, addToWatchlist, removeFromWatchlist, type DiscoverCandidate } from './plex/discover.js'
 import { notify } from './notify.js'
 
 export type ReverseDeps = { config: Config; store: Store; fetchImpl?: typeof fetch }
@@ -30,11 +30,12 @@ function intersects(a: Record<string, string | undefined>, b: Record<string, str
 
 export async function reconcileWatchlist(
   deps: ReverseDeps,
-): Promise<{ added: number; unresolved: number; skipped: number; deferred: number }> {
-  const out = { added: 0, unresolved: 0, skipped: 0, deferred: 0 }
+): Promise<{ added: number; removed: number; unresolved: number; skipped: number; deferred: number }> {
+  const out = { added: 0, removed: 0, unresolved: 0, skipped: 0, deferred: 0 }
   if (!deps.config.reverseSync) return out
 
-  const due = deps.store.dueUnlinkedTitles(new Date().toISOString(), deps.config.reverseBatch)
+  const cutoff = deps.config.reverseFollowedSince
+  const due = deps.store.dueUnlinkedTitles(new Date().toISOString(), deps.config.reverseBatch, cutoff)
   const dd = { plexToken: deps.config.plexToken, fetchImpl: deps.fetchImpl }
   const rd = { store: deps.store, fetchImpl: deps.fetchImpl, searchMaxPages: deps.config.searchMaxPages }
 
@@ -130,7 +131,82 @@ export async function reconcileWatchlist(
     console.log(`[reverse] added to plex watchlist: ${t.title} (${t.year}) -> ${ratingKey}`)
     out.added++
   }
+
+  await sweepRemovals(deps, dd, cutoff, out)
   return out
+}
+
+/**
+ * Take back off the watchlist what no longer belongs there.
+ *
+ * The exact complement of the add loop above -- dueRemovableTitles and
+ * dueUnlinkedTitles are two readings of one predicate -- so nothing can be
+ * added and removed in the same cycle. It gets its own batch allowance rather
+ * than sharing one, or a long removal backlog would starve new adds (the
+ * first run after a cutoff is set has hundreds of removals and no adds).
+ *
+ * Only titles carrying OUR link are touched: the state ('added', or 'remove'
+ * once an unfollow was mirrored) is the record that this service put the title
+ * there, so a title watchlisted by hand in plex is never removed.
+ */
+async function sweepRemovals(
+  deps: ReverseDeps, dd: { plexToken: string; fetchImpl?: typeof fetch },
+  cutoff: string | null, out: { removed: number; skipped: number },
+): Promise<void> {
+  // Previewing shows the WHOLE backlog, not one REVERSE_BATCH of it: a list of
+  // ten out of two hundred cannot answer "is this safe to run?", which is the
+  // only question the preview exists to settle. The batch bound is for the live
+  // sweep, where it paces real plex writes. The cap is there so a pathological
+  // mirror cannot print forever.
+  const live = deps.config.reverseRemove && !deps.config.dryRun
+  const due = deps.store.dueRemovableTitles(
+    new Date().toISOString(), live ? deps.config.reverseBatch : PREVIEW_MAX, cutoff)
+
+  for (const { titleId, ratingKey, title, year, reason } of due) {
+    // Not live: say exactly what would go and why, and leave the title as
+    // eligible as it was found -- no plex call, no bookkeeping.
+    if (!live) {
+      console.log(`[reverse] would remove: ${title ?? titleId}${year ? ` (${year})` : ''} — ${reason} [${titleId} -> ${ratingKey}]`)
+      out.skipped++; continue
+    }
+    try {
+      await removeFromWatchlist(dd, ratingKey)
+    } catch (e) {
+      await failRemoval(deps, titleId, ratingKey, `removeFromWatchlist failed for ${titleId}: ${(e as Error).message}`)
+      continue
+    }
+    // Only now: the link is the only thing that knows how to undo the add, so
+    // it outlives every failure and is dropped exclusively on plex's word.
+    // Dropping it also makes the title addable again if it ever becomes
+    // eligible, which is what makes un-hiding one put it back.
+    deps.store.deletePlexLink(titleId)
+    console.log(`[reverse] removed from plex watchlist: ${title ?? titleId} [${titleId} -> ${ratingKey}]`)
+    out.removed++
+  }
+
+  if (!live && due.length) {
+    console.log(`[reverse] ${due.length} title(s) listed above would come off the plex watchlist`
+      + ` — set REVERSE_REMOVE=true to apply${due.length === PREVIEW_MAX ? ` (list truncated at ${PREVIEW_MAX})` : ''}`)
+  }
+}
+
+// Enough to print a decade of follows in one go, bounded so a broken mirror
+// cannot fill the log indefinitely.
+const PREVIEW_MAX = 1000
+
+// Keeps the ratingKey and backs off. Forgetting the link here would strand the
+// title on the watchlist with nothing left that knows how to take it off.
+// Notifies on the FIRST failure only: a discover outage hits every title in the
+// batch, and one bad afternoon should not be hundreds of notifications.
+async function failRemoval(deps: ReverseDeps, titleId: string, ratingKey: string, reason: string) {
+  const prev = deps.store.getPlexLink(titleId)
+  const attempts = (prev?.state === 'remove' ? prev.attempts : 0) + 1
+  deps.store.putPlexLink({
+    titleId, ratingKey, state: 'remove', attempts,
+    nextTryAt: new Date(Date.now() + reverseBackoffMs(attempts - 1)).toISOString(),
+  })
+  deps.store.recordFailure('reverse', reason, { titleId })
+  if (attempts === 1) await notify(deps.config.notifyUrl, `reverse sync: ${reason}`, deps.fetchImpl)
 }
 
 async function fail(deps: ReverseDeps, titleId: string, reason: string) {

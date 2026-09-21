@@ -33,6 +33,16 @@ const Schema = z.object({
   // enables it (a typo is off, the safe direction).
   REVERSE_SYNC: z.string().default('false'),
   REVERSE_BATCH: z.coerce.number().default(10),
+  // Only follows added on or after this date are pushed to the plex watchlist,
+  // and anything already pushed that predates it is taken back off. Compared
+  // against followedAt as a STRING, which is why an ISO prefix is required and
+  // anything else is refused: a value that does not compare cleanly either
+  // matches every row or none, and "none" strips the whole watchlist silently.
+  // Taking a title back OFF the watchlist is destructive and asymmetric with
+  // adding one, so it is opt-in on its own: with anything but the exact string
+  // "true", the sweep logs the full list it WOULD remove and touches nothing.
+  REVERSE_REMOVE: z.string().default('false'),
+  REVERSE_FOLLOWED_SINCE: z.string().regex(/^\d{4}-\d{2}-\d{2}/, 'must be an ISO date, e.g. 2026-09-21').optional(),
   // Rating sync is OPT-IN for the same reason: it writes to two live
   // accounts, and its first run touches every already-rated item. Unset
   // means off and only the exact string 'true' enables it.
@@ -61,6 +71,8 @@ export function loadConfig(env: NodeJS.ProcessEnv) {
     notifyUrl: e.NOTIFY_URL ?? null,
     reverseSync: e.REVERSE_SYNC === 'true',
     reverseBatch: e.REVERSE_BATCH,
+    reverseRemove: e.REVERSE_REMOVE === 'true',
+    reverseFollowedSince: e.REVERSE_FOLLOWED_SINCE ?? null,
     ratingSync: e.RATING_SYNC === 'true',
   }
 }

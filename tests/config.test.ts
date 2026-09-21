@@ -85,3 +85,31 @@ describe('loadConfig', () => {
     expect(loadConfig(without as NodeJS.ProcessEnv).bingersCookie).toBe('')
   })
 })
+
+describe('REVERSE_FOLLOWED_SINCE', () => {
+  it('defaults to null, which means no cutoff and unchanged behaviour', () => {
+    expect(loadConfig({ ...base } as NodeJS.ProcessEnv).reverseFollowedSince).toBeNull()
+  })
+
+  it('keeps a plain date as given, so it can be compared against followedAt as a string', () => {
+    expect(loadConfig({ ...base, REVERSE_FOLLOWED_SINCE: '2026-09-21' } as NodeJS.ProcessEnv).reverseFollowedSince)
+      .toBe('2026-09-21')
+  })
+
+  // A typo here is silent and expensive: an unparseable value compared as a
+  // string either matches everything or nothing, and "nothing" means the sweep
+  // quietly strips the whole plex watchlist. Refuse to boot instead.
+  it('refuses a value that is not an ISO date', () => {
+    expect(() => loadConfig({ ...base, REVERSE_FOLLOWED_SINCE: 'last tuesday' } as NodeJS.ProcessEnv)).toThrow()
+  })
+})
+
+describe('REVERSE_REMOVE', () => {
+  it('leaves removal OFF unless REVERSE_REMOVE is exactly "true"', () => {
+    expect(loadConfig(base as NodeJS.ProcessEnv).reverseRemove).toBe(false)
+    expect(loadConfig({ ...base, REVERSE_REMOVE: 'true' } as NodeJS.ProcessEnv).reverseRemove).toBe(true)
+    for (const typo of ['TRUE', 'yes', '1', 'True', '']) {
+      expect(loadConfig({ ...base, REVERSE_REMOVE: typo } as NodeJS.ProcessEnv).reverseRemove).toBe(false)
+    }
+  })
+})

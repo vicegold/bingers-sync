@@ -104,6 +104,25 @@ Verify the log looks right, then set `DRY_RUN=false` and restart.
   every Bingers follow that is not already linked, which for a long follow
   history means a large batch of download requests — `REVERSE_BATCH` limits how
   many are reconciled per pull.
+- `REVERSE_FOLLOWED_SINCE` (an ISO date, e.g. `2026-09-21`) narrows that to
+  follows added on or after it, which is what makes turning reverse sync on
+  bearable with a decade of watchlist behind you. It works in both directions:
+  anything already on the Plex watchlist **that this service put there** and
+  whose follow now predates the cutoff is taken back off. So are follows you
+  unfollowed, hid from your Bingers watchlist, marked stopped, or moved to Watch
+  Later — those apply whether or not a cutoff is set, since they are statements
+  of intent rather than of age. Titles you added to the Plex watchlist yourself
+  are never touched: only a title carrying a `plex_link` this service wrote is
+  ever removed. Un-hide something and it goes back, because the add and remove
+  rules are the same rule read in two directions.
+- Removing is opt-in separately from the cutoff: until `REVERSE_REMOVE=true`
+  (that exact string), every reconcile logs the complete list it *would* take
+  off — name, year and the reason (`hidden`, `stopped`, `for later`,
+  `unfollowed`, or `followed before <date>`) — and calls Plex not at all. The
+  preview is deliberately not capped by `REVERSE_BATCH`, since ten lines out of
+  two hundred cannot tell you whether the sweep is safe to run; the batch still
+  paces the real thing. So setting a cutoff can never remove anything by
+  itself: you read the list first, then turn removal on.
 - With `RATING_SYNC=true`, episode and movie ratings sync both ways. Plex stores
   half-stars (0–10) and Bingers whole stars (1–5), so a rating you set in Plex is
   mirrored into Bingers and, while you leave it alone in Bingers, never written
